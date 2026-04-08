@@ -1,12 +1,22 @@
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>ArkWeb Security Test</title>
-</head>
-<body>
-<h3>CVE-2025-5419 ArkWeb Test</h3>
-<div id="log" style="font-family:monospace;font-size:12px;white-space:pre-wrap;background:#111;color:#0f0;padding:10px;"></div>
-<script src="exploit.js"></script>
-</body>
-</html>
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>LOADING</title></head>
+<body><h3 id="status">Loading exploit...</h3>
+<pre id="log" style="font-size:11px;background:#111;color:#0f0;padding:8px;max-height:400px;overflow:auto;"></pre>
+<script>
+function log(m){document.getElementById('log').textContent+=m+'\n';document.title='['+m.substring(0,40)+']';}
+log('JS_STARTED');
+
+// 简单验证 V8 功能
+try {
+  let ab = new ArrayBuffer(8);
+  let f64 = new Float64Array(ab);
+  let b64 = new BigInt64Array(ab);
+  f64[0] = 1.1;
+  log('BigInt64: 0x' + b64[0].toString(16));
+  log('V8_BASIC_OK');
+  document.title = 'V8_OK';
+} catch(e) {
+  log('V8_ERROR: ' + e.message);
+  document.title = 'V8_ERR';
+}
+</script>
+</body></html>
