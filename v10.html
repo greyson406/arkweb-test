@@ -1,0 +1,184 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>LOADING</title></head>
+<body><h3>v10</h3>
+<pre id="log" style="font-size:10px;background:#111;color:#0f0;padding:8px;max-height:700px;overflow:auto;white-space:pre-wrap;"></pre>
+<script>
+function log(m){let e=document.getElementById('log');if(e)e.innerHTML+=m+'\n';document.title='['+m.substring(0,50)+']';}
+function leb(v){let r=[];do{let b=v&0x7f;v>>=7;if(v)b|=0x80;r.push(b)}while(v);return r}
+
+// Correct WASM module builder with memory support
+function wasmModule(){
+  let sections=[];
+  let types=[], funcs=[], exports=[], codes=[], mems=[], imports=[];
+  let self={
+    addFunc(params,results,locals,body){
+      let ti=types.length;
+      types.push({params,results});
+      funcs.push(ti);
+      codes.push({locals,body});
+      return funcs.length-1;
+    },
+    exportFunc(name,idx){exports.push({name,kind:0,idx});return self;},
+    addMemory(initial,max){mems.push({initial,max});return self;},
+    exportMem(name,idx){exports.push({name,kind:2,idx:idx||0});return self;},
+    build(){
+      let b=[0,0x61,0x73,0x6d,1,0,0,0];
+      // types
+      let ts=[...leb(types.length)];
+      for(let t of types){ts.push(0x60,...leb(t.params.length),...t.params,...leb(t.results.length),...t.results);}
+      b.push(1,...leb(ts.length),...ts);
+      // memory
+      if(mems.length){
+        let ms=[...leb(mems.length)];
+        for(let m of mems){
+          if(m.max!==undefined) ms.push(1,...leb(m.initial),...leb(m.max));
+          else ms.push(0,...leb(m.initial));
+        }
+        b.push(5,...leb(ms.length),...ms);
+      }
+      // funcs
+      let fs=[...leb(funcs.length),...funcs.map(i=>leb(i)).flat()];
+      b.push(3,...leb(fs.length),...fs);
+      // exports
+      let es=[...leb(exports.length)];
+      for(let e of exports){
+        let nb=[...new TextEncoder().encode(e.name)];
+        es.push(...leb(nb.length),...nb,e.kind,...leb(e.idx));
+      }
+      b.push(7,...leb(es.length),...es);
+      // code
+      let cs=[...leb(codes.length)];
+      for(let c of codes){
+        let body=[];
+        if(c.locals&&c.locals.length){
+          body.push(...leb(c.locals.length));
+          for(let l of c.locals) body.push(...leb(l.count),l.type);
+        }else body.push(0);
+        body.push(...c.body,0x0b);
+        cs.push(...leb(body.length),...body);
+      }
+      b.push(0x0a,...leb(cs.length),...cs);
+      return new Uint8Array(b);
+    }
+  };
+  return self;
+}
+
+async function fuzz(){
+  log('[*] v10 — deep WASM + GC stress');
+
+  // === Fix: WASM memory module ===
+  log('\n=== WASM Memory ===');
+  try{
+    let w=wasmModule();
+    // func load(addr:i32)->i32: i32.load(addr)
+    w.addFunc([0x7f],[0x7f],[],[0x20,0, 0x28,0x02,0x00]); // local.get 0, i32.load align=4 offset=0
+    // func store(addr:i32, val:i32): i32.store(addr,val), return val
+    w.addFunc([0x7f,0x7f],[0x7f],[],[0x20,0, 0x20,1, 0x36,0x02,0x00, 0x20,1]); // local.get 0,1, i32.store, local.get 1
+    // func grow(pages:i32)->i32: memory.grow
+    w.addFunc([0x7f],[0x7f],[],[0x20,0, 0x40,0x00]); // local.get 0, memory.grow 0
+    w.addMemory(1).exportMem('m').exportFunc('load',0).exportFunc('store',1).exportFunc('grow',2);
+    let mod=new WebAssembly.Module(w.build());
+    let inst=new WebAssembly.Instance(mod);
+    let {load,store,grow,m}=inst.exports;
+
+    // Basic test
+    store(0,0xDEADBEEF);
+    let v=load(0);
+    log('[+] store/load: 0x'+(v>>>0).toString(16)+' '+(v===-559038737?'OK':''));
+
+    // Boundary test: load at page boundary
+    store(65532,0x41414141);
+    log('[+] boundary store OK');
+    let bv=load(65532);
+    log('[+] boundary load: 0x'+(bv>>>0).toString(16));
+
+    // OOB: load beyond 1 page
+    try{
+      let oob=load(65536);
+      log('[!] OOB load succeeded: 0x'+(oob>>>0).toString(16)+' — BUG!');
+    }catch(e){log('[*] OOB trapped: '+e.message.substring(0,40));}
+
+    // Grow and access new memory
+    let prev=grow(10);
+    log('[+] grow(10): prev='+prev+' bufSize='+m.buffer.byteLength);
+    store(65536,0xBEEFCAFE);
+    log('[+] post-grow store at 65536 OK');
+    let gv=load(65536);
+    log('[+] post-grow load: 0x'+(gv>>>0).toString(16));
+
+    // Rapid grow/shrink cycle — stress test allocator
+    for(let i=0;i<20;i++){
+      let r=grow(100); // grow 100 pages each time
+      if(r===-1){log('[*] grow failed at iter '+i+' total='+(m.buffer.byteLength/65536));break;}
+    }
+    log('[+] Final mem size: '+(m.buffer.byteLength/1024/1024).toFixed(1)+'MB');
+
+  }catch(e){log('[!] memory: '+e.constructor.name+': '+e.message.substring(0,100));}
+
+  // === GC stress: rapid alloc/dealloc of WASM instances ===
+  log('\n=== WASM instance GC stress ===');
+  try{
+    let w=wasmModule();
+    w.addFunc([],[0x7f],[],[0x41,0x2a]); // () -> i32.const 42
+    w.exportFunc('f',0);
+    let bytes=w.build();
+    let compiled=new WebAssembly.Module(bytes);
+
+    let t0=Date.now();
+    let instances=[];
+    for(let i=0;i<10000;i++){
+      instances.push(new WebAssembly.Instance(compiled));
+      if(i%1000===999){
+        instances.length=0; // drop references, trigger GC
+      }
+    }
+    log('[+] 10k instances: '+(Date.now()-t0)+'ms');
+
+    // Check memory integrity
+    let check=new Float64Array(100);
+    check.fill(Math.PI);
+    let ok=true;
+    for(let i=0;i<100;i++)if(check[i]!==Math.PI){log('[!] CORRUPTION at '+i);ok=false;}
+    if(ok) log('[*] Integrity OK');
+  }catch(e){log('[!] gc stress: '+e.message.substring(0,80));}
+
+  // === WebGL enumeration ===
+  log('\n=== WebGL ===');
+  try{
+    let c=document.createElement('canvas');
+    let gl=c.getContext('webgl2')||c.getContext('webgl');
+    if(gl){
+      log('[+] WebGL: '+gl.getParameter(gl.VERSION));
+      log('[+] Renderer: '+gl.getParameter(gl.RENDERER));
+      log('[+] Vendor: '+gl.getParameter(gl.VENDOR));
+      let dbg=gl.getExtension('WEBGL_debug_renderer_info');
+      if(dbg){
+        log('[+] Unmasked renderer: '+gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL));
+        log('[+] Unmasked vendor: '+gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL));
+      }
+      log('[+] Max tex size: '+gl.getParameter(gl.MAX_TEXTURE_SIZE));
+      log('[+] Extensions: '+gl.getSupportedExtensions().length);
+    }else log('[!] No WebGL');
+  }catch(e){log('[!] WebGL: '+e.message.substring(0,80));}
+
+  // === Concurrent WASM compilation ===
+  log('\n=== Concurrent WASM compile ===');
+  try{
+    let w=wasmModule();
+    w.addFunc([],[0x7f],[{count:50000,type:0x7f}],[0x41,0x00]); // 50k locals
+    w.exportFunc('f',0);
+    let bytes=w.build();
+    let t0=Date.now();
+    let promises=[];
+    for(let i=0;i<50;i++){
+      promises.push(WebAssembly.compile(bytes));
+    }
+    let results=await Promise.all(promises);
+    log('[+] 50 concurrent compiles of 50k-local module: '+(Date.now()-t0)+'ms');
+    // This might stress the WASM compiler threads and trigger race conditions
+  }catch(e){log('[!] concurrent: '+e.message.substring(0,80));}
+
+  log('\n[*] v10 done.');
+}
+setTimeout(fuzz,500);
+</script></body></html>
