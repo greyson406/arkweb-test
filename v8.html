@@ -1,0 +1,164 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>LOADING</title></head>
+<body><h3>WASM Fuzz v8</h3>
+<pre id="log" style="font-size:10px;background:#111;color:#0f0;padding:8px;max-height:700px;overflow:auto;white-space:pre-wrap;"></pre>
+<script>
+function log(m){let e=document.getElementById('log');if(e)e.innerHTML+=m+'\n';document.title='['+m.substring(0,50)+']';}
+function leb(v){let r=[];do{let b=v&0x7f;v>>=7;if(v)b|=0x80;r.push(b)}while(v);return r}
+function sleb(v){let r=[];let more=true;while(more){let b=v&0x7f;v>>=7;if((v===0&&(b&0x40)===0)||(v===-1&&(b&0x40)!==0))more=false;else b|=0x80;r.push(b)}return r}
+
+// Build WASM module with configurable features
+function buildWasm(opts){
+  let b=[0,0x61,0x73,0x6d,1,0,0,0];
+
+  // Type section
+  let pc=opts.params||0;
+  let ts=[...leb(1),0x60,...leb(pc)];
+  for(let i=0;i<pc;i++)ts.push(opts.paramType||0x7f);
+  ts.push(...leb(opts.results||1),opts.resultType||0x7f);
+  b.push(1,...leb(ts.length),...ts);
+
+  // Memory section (if requested)
+  if(opts.memory){
+    let ms=[...leb(1),0,...leb(opts.memPages||1)]; // 1 mem, no max, initial pages
+    b.push(5,...leb(ms.length),...ms);
+  }
+
+  // Func section
+  let fs=[...leb(1),0];
+  b.push(3,...leb(fs.length),...fs);
+
+  // Export section
+  let es=[...leb(opts.memory?2:1)];
+  es.push(1,0x66,0,0); // export "f" = func 0
+  if(opts.memory) es.push(1,0x6d,2,0); // export "m" = memory 0
+  b.push(7,...leb(es.length),...es);
+
+  // Code section
+  let body=[];
+  // Locals
+  if(opts.locals){
+    body.push(...leb(opts.locals.length));
+    for(let l of opts.locals) body.push(...leb(l.count),l.type);
+  } else {
+    body.push(0);
+  }
+  // Code
+  if(opts.code) body.push(...opts.code);
+  else body.push(0x41,0x2a); // i32.const 42
+  body.push(0x0b); // end
+
+  let ce=[...leb(body.length),...body];
+  let cs=[...leb(1),...ce];
+  b.push(0x0a,...leb(cs.length),...cs);
+  return new Uint8Array(b);
+}
+
+function fuzz(){
+  log('[*] ArkWeb WASM Fuzzer v8');
+  log('[*] Testing various WASM edge cases...');
+  let crashes=0;
+
+  // Test 1: Large number of locals
+  log('\n=== Test: Local variable limits ===');
+  for(let n of [100,1000,10000,50000,65535]){
+    try{
+      let m=new WebAssembly.Module(buildWasm({
+        locals:[{count:n,type:0x7f}],
+        code:[0x20,0] // local.get 0
+      }));
+      let i=new WebAssembly.Instance(m);
+      log('[+] '+n+' locals: OK');
+    }catch(e){log('[!] '+n+' locals: '+e.message.substring(0,100));}
+  }
+
+  // Test 2: Deep nesting (blocks)
+  log('\n=== Test: Block nesting depth ===');
+  for(let depth of [10,50,100,500,1000]){
+    try{
+      let code=[];
+      for(let i=0;i<depth;i++) code.push(0x02,0x40); // block void
+      code.push(0x41,0x2a); // i32.const 42
+      for(let i=0;i<depth;i++) code.push(0x0b); // end
+      let m=new WebAssembly.Module(buildWasm({code:code}));
+      let i=new WebAssembly.Instance(m);
+      let r=i.exports.f();
+      log('[+] depth='+depth+': OK r='+r);
+    }catch(e){log('[!] depth='+depth+': '+e.message.substring(0,100));}
+  }
+
+  // Test 3: Memory operations at boundaries
+  log('\n=== Test: Memory boundary ops ===');
+  try{
+    // i32.load at offset near page boundary
+    let m=new WebAssembly.Module(buildWasm({
+      memory:true, memPages:1,
+      code:[0x41,0x00, 0x28,0x02,0x80,0xfe,0x03] // i32.load offset=65408 (near 64KB boundary)
+    }));
+    let i=new WebAssembly.Instance(m);
+    try{
+      let r=i.exports.f();
+      log('[+] Load near boundary: r='+r);
+    }catch(e){log('[!] Load near boundary runtime: '+e.message.substring(0,80));}
+  }catch(e){log('[!] Load near boundary compile: '+e.message.substring(0,80));}
+
+  // Test 4: i64 operations (BigInt interop edge cases)
+  log('\n=== Test: i64/BigInt interop ===');
+  try{
+    let ts=[...leb(1),0x60,...leb(1),0x7e,...leb(1),0x7e]; // func(i64)->i64
+    let b=[0,0x61,0x73,0x6d,1,0,0,0];
+    b.push(1,...leb(ts.length),...ts);
+    b.push(3,...leb(2),...leb(1),0);
+    b.push(7,...leb(4),1,1,0x66,0,0);
+    let body=[0,0x20,0,0x0b]; // local.get 0, end
+    let ce=[...leb(body.length),...body];
+    let cs=[...leb(1),...ce];
+    b.push(0x0a,...leb(cs.length),...cs);
+    let m=new WebAssembly.Module(new Uint8Array(b));
+    let i=new WebAssembly.Instance(m);
+    // Test with edge values
+    for(let v of [0n, 1n, -1n, 0x7fffffffffffffffn, -0x8000000000000000n, 0xffffffffffffffffn]){
+      try{
+        let r=i.exports.f(v);
+        log('[+] i64('+v+'): r='+r);
+      }catch(e){log('[!] i64('+v+'): '+e.message.substring(0,80));}
+    }
+  }catch(e){log('[!] i64 module: '+e.message.substring(0,80));}
+
+  // Test 5: Massive memory growth
+  log('\n=== Test: Memory growth ===');
+  try{
+    let m=new WebAssembly.Module(buildWasm({memory:true,memPages:1,code:[0x41,0x80,0x08,0x40,0x00,0x0b]}));
+    // memory.grow 1024 pages (64MB)
+    // Actually let me use simpler: i32.const 1024, memory.grow, end
+    // 0x41 = i32.const, then LEB128 1024 = 0x80 0x08, 0x40 0x00 = memory.grow 0
+    let i=new WebAssembly.Instance(m);
+    let r=i.exports.f();
+    log('[+] memory.grow 1024: r='+r+' (prev pages)');
+  }catch(e){log('[!] memory.grow: '+e.message.substring(0,100));}
+
+  // Test 6: Recursive calls via table
+  log('\n=== Test: Table indirect call ===');
+  // Skip for now - complex encoding
+
+  // Test 7: exact boundary param count 1000
+  log('\n=== Test: Param count 1000 stress ===');
+  try{
+    let m=new WebAssembly.Module(buildWasm({params:1000}));
+    let i=new WebAssembly.Instance(m);
+    let a=new Array(1000).fill(0);
+    // Call many times to trigger tier-up
+    let t0=Date.now();
+    for(let j=0;j<50000;j++) i.exports.f.apply(null,a);
+    log('[+] 1000 params x 50k calls: '+(Date.now()-t0)+'ms');
+    // Check for corruption after heavy WASM usage
+    let s=new ArrayBuffer(4096);
+    let v=new DataView(s);
+    v.setFloat64(0,Math.PI);
+    if(v.getFloat64(0)!==Math.PI) log('[+] CORRUPTION!');
+    else log('[*] Integrity OK');
+  }catch(e){log('[!] '+e.message.substring(0,100));}
+
+  log('\n[*] Fuzzer done. Crashes: '+crashes);
+}
+setTimeout(fuzz,500);
+</script></body></html>
