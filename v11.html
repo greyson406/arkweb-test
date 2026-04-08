@@ -1,0 +1,137 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>LOADING</title></head>
+<body><h3>v11 WebGL</h3>
+<pre id="log" style="font-size:10px;background:#111;color:#0f0;padding:8px;max-height:700px;overflow:auto;white-space:pre-wrap;"></pre>
+<canvas id="c" width="256" height="256" style="display:none;"></canvas>
+<script>
+function log(m){let e=document.getElementById('log');if(e)e.innerHTML+=m+'\n';document.title='['+m.substring(0,50)+']';}
+
+function fuzz(){
+  log('[*] v11 — WebGL Maleoon 910 stress');
+  let c=document.getElementById('c');
+  let gl=c.getContext('webgl2');
+  if(!gl){log('[!] No WebGL2');return;}
+
+  log('[+] WebGL2 OK: '+gl.getParameter(gl.VERSION));
+  let dbg=gl.getExtension('WEBGL_debug_renderer_info');
+  if(dbg) log('[+] GPU: '+gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL));
+
+  // List all extensions
+  let exts=gl.getSupportedExtensions();
+  log('[+] Extensions ('+exts.length+'): '+exts.join(', '));
+
+  // === Test 1: Large texture allocation ===
+  log('\n=== Large textures ===');
+  let maxSize=gl.getParameter(gl.MAX_TEXTURE_SIZE);
+  log('[*] Max tex size: '+maxSize);
+  for(let size of [1024,2048,4096,8192]){
+    try{
+      let tex=gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D,tex);
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,size,size,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+      let err=gl.getError();
+      log('[+] '+size+'x'+size+' tex: '+(err===0?'OK':'err=0x'+err.toString(16)));
+      gl.deleteTexture(tex);
+    }catch(e){log('[!] '+size+': '+e.message.substring(0,80));}
+  }
+
+  // === Test 2: Shader compilation with edge cases ===
+  log('\n=== Shader edge cases ===');
+  // Very long shader
+  let longShader='precision mediump float;\n';
+  for(let i=0;i<500;i++) longShader+='uniform float u'+i+';\n';
+  longShader+='void main(){float sum=0.0;';
+  for(let i=0;i<500;i++) longShader+='sum+=u'+i+';';
+  longShader+='gl_FragColor=vec4(sum,0,0,1);}\n';
+  try{
+    let fs=gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs,longShader);
+    gl.compileShader(fs);
+    let ok=gl.getShaderParameter(fs,gl.COMPILE_STATUS);
+    log('[+] 500 uniform shader: '+(ok?'compiled':'failed: '+gl.getShaderInfoLog(fs).substring(0,80)));
+    gl.deleteShader(fs);
+  }catch(e){log('[!] shader: '+e.message.substring(0,80));}
+
+  // === Test 3: Framebuffer with unusual formats ===
+  log('\n=== FBO formats ===');
+  let formats=[
+    [gl.RGBA8,'RGBA8'],[gl.RGBA16F,'RGBA16F'],[gl.RGBA32F,'RGBA32F'],
+    [gl.R11F_G11F_B10F,'R11F_G11F_B10F'],[gl.RG16F,'RG16F'],
+    [gl.DEPTH_COMPONENT24,'DEPTH24'],[gl.DEPTH32F_STENCIL8,'DEPTH32F_S8']
+  ];
+  for(let [fmt,name] of formats){
+    try{
+      let fb=gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER,fb);
+      let rb=gl.createRenderbuffer();
+      gl.bindRenderbuffer(gl.RENDERBUFFER,rb);
+      gl.renderbufferStorage(gl.RENDERBUFFER,fmt,256,256);
+      let attachment=(name.startsWith('DEPTH')?gl.DEPTH_ATTACHMENT:gl.COLOR_ATTACHMENT0);
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER,attachment,gl.RENDERBUFFER,rb);
+      let status=gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      log('[+] '+name+': '+(status===gl.FRAMEBUFFER_COMPLETE?'OK':'status=0x'+status.toString(16)));
+      gl.deleteFramebuffer(fb);
+      gl.deleteRenderbuffer(rb);
+    }catch(e){log('[!] '+name+': '+e.message.substring(0,60));}
+  }
+
+  // === Test 4: Transform feedback (WebGL2) — unusual driver path ===
+  log('\n=== Transform Feedback ===');
+  try{
+    let vs='#version 300 es\nin vec4 pos;out float vOut;void main(){vOut=pos.x;gl_Position=pos;}';
+    let fs2='#version 300 es\nprecision mediump float;out vec4 c;void main(){c=vec4(1);}';
+    let vsh=gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vsh,vs);gl.compileShader(vsh);
+    let fsh=gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fsh,fs2);gl.compileShader(fsh);
+    let prog=gl.createProgram();
+    gl.attachShader(prog,vsh);gl.attachShader(prog,fsh);
+    gl.transformFeedbackVaryings(prog,['vOut'],gl.SEPARATE_ATTRIBS);
+    gl.linkProgram(prog);
+    let linked=gl.getProgramParameter(prog,gl.LINK_STATUS);
+    log('[+] TF program: '+(linked?'linked':'failed'));
+    if(linked){
+      let tf=gl.createTransformFeedback();
+      let tfBuf=gl.createBuffer();
+      gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER,tfBuf);
+      gl.bufferData(gl.TRANSFORM_FEEDBACK_BUFFER,1024,gl.DYNAMIC_READ);
+      gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK,tf);
+      gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER,0,tfBuf);
+      gl.useProgram(prog);
+      // Create vertex data
+      let vb=gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER,vb);
+      gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([1,2,3,4,5,6,7,8]),gl.STATIC_DRAW);
+      let loc=gl.getAttribLocation(prog,'pos');
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc,4,gl.FLOAT,false,0,0);
+      gl.beginTransformFeedback(gl.POINTS);
+      gl.drawArrays(gl.POINTS,0,2);
+      gl.endTransformFeedback();
+      // Read back
+      let result=new Float32Array(2);
+      gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER,tfBuf);
+      gl.getBufferSubData(gl.TRANSFORM_FEEDBACK_BUFFER,0,result);
+      log('[+] TF result: ['+result[0]+','+result[1]+']');
+    }
+  }catch(e){log('[!] TF: '+e.message.substring(0,80));}
+
+  // === Test 5: Rapid create/destroy cycle ===
+  log('\n=== GPU resource churn ===');
+  try{
+    let t0=Date.now();
+    for(let i=0;i<10000;i++){
+      let t=gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D,t);
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,16,16,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+      gl.deleteTexture(t);
+    }
+    log('[+] 10k tex create/destroy: '+(Date.now()-t0)+'ms');
+    // Check GL state
+    let err=gl.getError();
+    log('[+] GL error: '+(err===0?'none':'0x'+err.toString(16)));
+  }catch(e){log('[!] churn: '+e.message.substring(0,80));}
+
+  log('\n[*] v11 done.');
+}
+setTimeout(fuzz,500);
+</script></body></html>
