@@ -1,0 +1,1250 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ArkWeb Mega-Fuzzer v1</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0a;color:#0f0;font:11px/1.4 monospace;padding:8px}
+#hdr{color:#0ff;font-size:14px;margin-bottom:8px}
+#stats{color:#ff0;margin-bottom:8px;font-size:12px}
+#log{height:calc(100vh - 80px);overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+.pass{color:#0f0}.crash{color:#f00;font-weight:bold}.exception{color:#f90}.info{color:#0ff}
+</style>
+</head>
+<body>
+<div id="hdr">ArkWeb Mega-Fuzzer v1 | Target: Chromium 132 / Maleoon 910</div>
+<div id="stats">Loading...</div>
+<div id="log"></div>
+<script>
+"use strict";
+const LOG = document.getElementById('log');
+const STATS = document.getElementById('stats');
+let counts = {pass:0, exception:0, crash:0, total:0};
+const T0 = Date.now();
+
+function ts(){return ((Date.now()-T0)/1000).toFixed(1)+'s'}
+function log(cat, name, result, cls){
+  counts.total++;
+  if(cls==='pass') counts.pass++;
+  else if(cls==='crash') counts.crash++;
+  else counts.exception++;
+  const d = document.createElement('div');
+  d.className = cls;
+  d.textContent = `[${ts()}] [${cat}] ${name} → ${result}`;
+  LOG.appendChild(d);
+  if(counts.total % 20 === 0) LOG.scrollTop = LOG.scrollHeight;
+  STATS.textContent = `Total:${counts.total} PASS:${counts.pass} EXCEPTION:${counts.exception} CRASH:${counts.crash}`;
+}
+
+function run(cat, name, fn){
+  try{
+    fn();
+    log(cat, name, 'PASS', 'pass');
+  }catch(e){
+    log(cat, name, 'EXCEPTION: '+e.message, 'exception');
+  }
+}
+
+async function runAsync(cat, name, fn){
+  try{
+    await fn();
+    log(cat, name, 'PASS', 'pass');
+  }catch(e){
+    log(cat, name, 'EXCEPTION: '+e.message, 'exception');
+  }
+}
+
+function randInt(a,b){return (Math.random()*(b-a)|0)+a}
+function randArr(n,mx){return Array.from({length:n},()=>randInt(0,mx))}
+function randStr(n){let s='';for(let i=0;i<n;i++)s+=String.fromCharCode(randInt(32,127));return s}
+function pick(a){return a[randInt(0,a.length)]}
+
+// ===================== V8 ENGINE FUZZ =====================
+
+// --- JIT Polymorphic IC Transitions ---
+function fuzzJIT_IC(){
+  const shapes = [];
+  for(let i=0;i<50;i++){
+    const o = {};
+    const nkeys = randInt(1,15);
+    for(let j=0;j<nkeys;j++) o['k'+randInt(0,100)] = randInt(0,1) ? randInt(0,9999) : randStr(randInt(1,20));
+    shapes.push(o);
+  }
+  function polyAccess(obj){return obj.k0 + obj.k1}
+  // Force IC megamorphic
+  for(let i=0;i<5000;i++) try{polyAccess(shapes[i%shapes.length])}catch(e){}
+}
+
+// --- OSR (On-Stack Replacement) boundaries ---
+function fuzzOSR(){
+  let sum=0;
+  // Hot loop to trigger OSR
+  for(let i=0;i<100000;i++){
+    sum += i;
+    if(i===50000){
+      // Mid-loop deopt trigger: change type
+      sum = sum + '';
+      sum = parseInt(sum)||0;
+    }
+  }
+  // Nested OSR
+  for(let i=0;i<1000;i++){
+    let inner=0;
+    for(let j=0;j<1000;j++){
+      inner += j;
+      if(j===500 && i%100===0) inner = BigInt(inner);
+      if(typeof inner==='bigint') inner = Number(inner);
+    }
+  }
+}
+
+// --- Turbofan type feedback poisoning ---
+function fuzzTypeFeedback(){
+  function add(a,b){return a+b}
+  // Train with ints
+  for(let i=0;i<10000;i++) add(i,i+1);
+  // Poison with string
+  add("foo","bar");
+  // Poison with object
+  add({valueOf(){return 42}},{valueOf(){return 43}});
+  // Poison with BigInt (may throw)
+  try{add(1n,2n)}catch(e){}
+  // Poison with Symbol
+  try{add(Symbol(),Symbol())}catch(e){}
+  // Re-call with ints to check deopt handling
+  for(let i=0;i<10000;i++) add(i,i+1);
+}
+
+// --- GC pressure + WeakRef + FinalizationRegistry ---
+function fuzzGC(){
+  const registry = new FinalizationRegistry((v)=>{});
+  const weakrefs = [];
+  for(let i=0;i<500;i++){
+    let obj = {data: new ArrayBuffer(randInt(100,10000))};
+    weakrefs.push(new WeakRef(obj));
+    registry.register(obj, 'ref'+i);
+    obj = null;
+  }
+  // Force GC pressure
+  const trash = [];
+  for(let i=0;i<2000;i++) trash.push(new ArrayBuffer(randInt(1000,50000)));
+  trash.length = 0;
+  // Check WeakRefs
+  let alive=0, dead=0;
+  for(const wr of weakrefs) wr.deref() ? alive++ : dead++;
+}
+
+// --- Prototype chain pollution + IC switch ---
+function fuzzProtoChain(){
+  function Base(){}
+  Base.prototype.x = 1;
+  function Mid(){} Mid.prototype = Object.create(Base.prototype);
+  function Leaf(){} Leaf.prototype = Object.create(Mid.prototype);
+  const obj = new Leaf();
+  function readX(o){return o.x}
+  for(let i=0;i<5000;i++) readX(obj);
+  // Mutate prototype mid-flight
+  Mid.prototype.x = 999;
+  readX(obj);
+  delete Mid.prototype.x;
+  readX(obj);
+  Base.prototype.__proto__ = {x:'polluted'};
+  readX(obj);
+  // Restore
+  Base.prototype.__proto__ = Object.prototype;
+}
+
+// --- RegExp edge cases ---
+function fuzzRegExp(){
+  const patterns = [
+    '(a+)+$', '(a|aa)+$', '((a+)b)+', '(?=a+)a',
+    `(${'.'.repeat(100)}){10}`, '\\p{L}+', '(?<name>\\d+)-\\k<name>',
+    `[${String.fromCodePoint(0x10000)}-${String.fromCodePoint(0x10FFFF)}]`
+  ];
+  for(const p of patterns){
+    try{
+      const re = new RegExp(p, 'u');
+      re.test(randStr(randInt(50,500)));
+      'aaaaaaaaaa!'.match(re);
+    }catch(e){}
+  }
+  // Large capture groups
+  try{
+    const bigRe = new RegExp('(a)'.repeat(200));
+    bigRe.exec('a'.repeat(200));
+  }catch(e){}
+}
+
+// --- BigInt cross-type ---
+function fuzzBigInt(){
+  const ops = [
+    ()=>BigInt(Number.MAX_SAFE_INTEGER)+1n,
+    ()=>BigInt(Number.MAX_SAFE_INTEGER)**10n,
+    ()=>{let x=1n;for(let i=0;i<1000;i++)x*=BigInt(randInt(2,100));return x},
+    ()=>BigInt(2)**BigInt(randInt(1000,50000)),
+    ()=>{try{return BigInt(2)+2}catch(e){return e}},
+    ()=>{try{return BigInt('invalid')}catch(e){return e}},
+    ()=>{const a=2n**64n; return a>>32n},
+    ()=>{try{return Math.max(1n,2n)}catch(e){return e}},
+  ];
+  for(const op of ops) try{op()}catch(e){}
+}
+
+// --- Intl API malformed params ---
+function fuzzIntl(){
+  const locales = ['en','zh','invalid-XX','','und','\x00',randStr(50)];
+  const ctors = [Intl.NumberFormat, Intl.DateTimeFormat, Intl.Collator, Intl.PluralRules, Intl.RelativeTimeFormat, Intl.ListFormat, Intl.Segmenter];
+  for(const Ctor of ctors){
+    for(const loc of locales){
+      try{new Ctor(loc)}catch(e){}
+      try{new Ctor(loc, {style:'invalid',minimumFractionDigits:999})}catch(e){}
+    }
+  }
+  try{Intl.getCanonicalLocales(['\x00','en-US-u-invalid'])}catch(e){}
+}
+
+// --- ArrayBuffer transfer + resize + detach ---
+function fuzzArrayBuffer(){
+  // Resizable ArrayBuffer
+  try{
+    const rab = new ArrayBuffer(1024, {maxByteLength: 4096});
+    const view = new Uint8Array(rab);
+    view[0]=42;
+    rab.resize(2048);
+    view[1024]=99;
+    rab.resize(512);
+    try{view[800]}catch(e){}
+    rab.resize(4096);
+  }catch(e){}
+
+  // Transfer
+  try{
+    const ab = new ArrayBuffer(256);
+    new Uint8Array(ab).fill(0xAA);
+    const ab2 = ab.transfer();
+    try{new Uint8Array(ab)[0]}catch(e){} // detached
+    new Uint8Array(ab2)[0]; // should be 0xAA
+  }catch(e){}
+
+  // Transfer to different size
+  try{
+    const ab = new ArrayBuffer(100);
+    const ab2 = ab.transfer(200);
+    const ab3 = ab2.transfer(50);
+  }catch(e){}
+
+  // SharedArrayBuffer (likely blocked on Huawei)
+  try{
+    const sab = new SharedArrayBuffer(1024);
+    const view = new Int32Array(sab);
+    Atomics.add(view, 0, 1);
+    Atomics.compareExchange(view, 0, 1, 2);
+  }catch(e){}
+}
+
+// --- Iterator protocol abuse ---
+function fuzzIterator(){
+  // Throw during iteration
+  const evilIterable = {
+    [Symbol.iterator](){
+      let i=0;
+      return {
+        next(){
+          if(i++>5) throw new Error('iterator bomb');
+          return {value:i, done:false};
+        },
+        return(){throw new Error('return bomb')}
+      };
+    }
+  };
+  try{for(const x of evilIterable){}}catch(e){}
+  try{[...evilIterable]}catch(e){}
+  try{Array.from(evilIterable)}catch(e){}
+  try{new Map([[evilIterable,'v']])}catch(e){}
+  try{Promise.all(evilIterable)}catch(e){}
+
+  // Mutating iterator
+  const arr=[1,2,3,4,5];
+  const it = arr[Symbol.iterator]();
+  it.next(); arr.length=0; it.next();
+  arr.push(1,2,3); it.next();
+}
+
+// --- Promise microtask depth ---
+function fuzzPromise(){
+  let depth=0;
+  function nest(){
+    if(depth++>500) return Promise.resolve('done');
+    return Promise.resolve().then(nest);
+  }
+  nest();
+
+  // Promise with throwing then
+  const evilThenable = {then(r,j){throw new Error('thenable bomb')}};
+  Promise.resolve(evilThenable).catch(()=>{});
+
+  // Circular promise-like
+  const cp = {then(r){r(cp)}};
+  Promise.resolve(cp).catch(()=>{});
+  setTimeout(()=>{},0); // break potential infinite
+
+  // Massive Promise.all
+  const many = Array.from({length:1000},(_,i)=>
+    i%3===0 ? Promise.resolve(i) : i%3===1 ? Promise.reject(i) : new Promise(r=>setTimeout(r,randInt(1,50),i))
+  );
+  Promise.allSettled(many);
+}
+
+// --- eval/Function constructor + JIT ---
+function fuzzEval(){
+  // Dynamic code gen
+  const codes = [
+    'var x=1;for(var i=0;i<10000;i++)x+=i;x',
+    'function f(n){return n<2?1:f(n-1)+f(n-2)}f(25)',
+    'new Proxy({},{get(t,p){return p}}).__proto__',
+    'Object.create(null,{x:{get(){return this}}})',
+    'eval("eval(\\"1+1\\")")',
+    `(${()=>{const a=[];for(let i=0;i<100;i++)a.push(i);return a.reduce((s,x)=>s+x,0)}})()`,
+  ];
+  for(const c of codes){
+    try{eval(c)}catch(e){}
+    try{new Function(c)()}catch(e){}
+  }
+  // Function with many params
+  try{
+    const params = Array.from({length:200},(_,i)=>'p'+i);
+    const body = params.join('+');
+    const f = new Function(...params, 'return '+body);
+    f(...Array(200).fill(1));
+  }catch(e){}
+}
+
+// --- Proxy deep ---
+function fuzzProxy(){
+  // Recursive proxy
+  let depth=0;
+  function makeProxy(target){
+    return new Proxy(target, {
+      get(t,p,r){
+        if(depth++>100) return t[p];
+        return makeProxy({[p]:t[p]});
+      },
+      set(t,p,v){t[p]=v;return true},
+      has(t,p){return true},
+      deleteProperty(t,p){return true},
+      ownKeys(t){return ['a','b','c']},
+      getOwnPropertyDescriptor(t,p){return {value:1,writable:true,enumerable:true,configurable:true}},
+    });
+  }
+  const p = makeProxy({a:1,b:2});
+  try{p.a.b.c.d.e}catch(e){}
+  depth=0;
+  try{JSON.stringify(p)}catch(e){}
+  depth=0;
+  try{Object.keys(p)}catch(e){}
+  depth=0;
+  try{for(const k in p){if(depth>20)break}}catch(e){}
+
+  // Revocable proxy use-after-revoke
+  const {proxy, revoke} = Proxy.revocable({x:1},{});
+  proxy.x;
+  revoke();
+  try{proxy.x}catch(e){}
+  try{proxy.x=2}catch(e){}
+  try{delete proxy.x}catch(e){}
+}
+
+// --- Map/Set size stress ---
+function fuzzCollections(){
+  const m = new Map();
+  for(let i=0;i<10000;i++) m.set(randStr(randInt(1,50)), randInt(0,99999));
+  for(const [k] of m){if(Math.random()<0.5)m.delete(k)}
+  const wm = new WeakMap();
+  const keys = [];
+  for(let i=0;i<500;i++){const k={};keys.push(k);wm.set(k,i)}
+  keys.length=0; // allow GC
+
+  // WeakSet
+  const ws = new WeakSet();
+  for(let i=0;i<500;i++) ws.add({});
+}
+
+// --- Symbol edge cases ---
+function fuzzSymbol(){
+  const syms = [];
+  for(let i=0;i<200;i++) syms.push(Symbol(randStr(randInt(0,100))));
+  const symObj = {};
+  for(const s of syms) symObj[s] = randInt(0,100);
+  Object.getOwnPropertySymbols(symObj);
+  // Symbol.toPrimitive abuse
+  const evil = {[Symbol.toPrimitive](hint){
+    if(hint==='number') return NaN;
+    if(hint==='string') throw new Error('no string');
+    return null;
+  }};
+  try{+evil}catch(e){}
+  try{`${evil}`}catch(e){}
+  try{evil==1}catch(e){}
+}
+
+// --- Structured clone edge cases ---
+function fuzzStructuredClone(){
+  const testVals = [
+    new Map([[1,2],[3,4]]),
+    new Set([1,2,{a:3}]),
+    new Date(NaN),
+    new Date(8640000000000001),
+    /test/giu,
+    new Blob(['data']),
+    new Int32Array([1,2,3]),
+    {nested:{deep:{val:42}}},
+  ];
+  for(const v of testVals){
+    try{structuredClone(v)}catch(e){}
+  }
+  // Circular reference
+  const circ = {};circ.self=circ;
+  try{structuredClone(circ)}catch(e){}
+  // Non-cloneable
+  try{structuredClone(()=>{})}catch(e){}
+  try{structuredClone(Symbol())}catch(e){}
+}
+
+// ===================== WASM FUZZ =====================
+
+function makeWasmModule(bytes){
+  const buf = new Uint8Array(bytes);
+  return new WebAssembly.Module(buf);
+}
+
+// --- Malformed WASM sections ---
+function fuzzWasmMalformed(){
+  const testCases = [
+    // Empty module (just magic + version)
+    [0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00],
+    // Bad magic
+    [0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00],
+    // Bad version
+    [0x00,0x61,0x73,0x6d,0xFF,0x00,0x00,0x00],
+    // Truncated
+    [0x00,0x61,0x73],
+    // Empty type section
+    [0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,0x01,0x01,0x00],
+    // Duplicate type sections
+    [0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,0x01,0x01,0x00,0x01,0x01,0x00],
+    // Oversized section length
+    [0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,0x01,0xFF,0xFF,0xFF,0x0F],
+    // Unknown section
+    [0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,0x00,0x05,0x04,0x74,0x65,0x73,0x74],
+  ];
+  for(let i=0;i<testCases.length;i++){
+    try{makeWasmModule(testCases[i])}catch(e){}
+  }
+}
+
+// --- Valid WASM with edge-case functions ---
+function fuzzWasmValid(){
+  // Helper to build minimal WASM module with specific functions
+  function buildWasm(funcs){
+    // This creates a valid module with type section, function section, export section, code section
+    const magic = [0x00,0x61,0x73,0x6d];
+    const version = [0x01,0x00,0x00,0x00];
+
+    // Type section: one func type () -> i32
+    const typeSection = [0x01, 0x04, 0x01, 0x60, 0x00, 0x01, 0x7f];
+
+    // Function section
+    const funcSection = [0x03, 0x02, 0x01, 0x00]; // 1 function, type 0
+
+    // Export section: export func 0 as "f"
+    const exportSection = [0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x00];
+
+    // Code section: each func body
+    const body = funcs;
+    const bodyLen = body.length;
+    const codeSection = [0x0a, bodyLen+3, 0x01, bodyLen+1, 0x00, ...body, 0x0b];
+
+    return [...magic,...version,...typeSection,...funcSection,...exportSection,...codeSection];
+  }
+
+  const bodies = [
+    // Just return 42
+    [0x41, 0x2a],
+    // Nested blocks
+    [0x02,0x7f, 0x02,0x7f, 0x41,0x01, 0x0b, 0x0b],
+    // Loop
+    [0x41,0x00, 0x03,0x7f, 0x41,0x01, 0x6a, 0x0c,0x00, 0x0b],
+    // br_table
+    [0x41,0x00, 0x02,0x7f, 0x02,0x7f, 0x41,0x00, 0x0e,0x01,0x00,0x01, 0x0b, 0x41,0x01, 0x0b],
+  ];
+
+  for(const b of bodies){
+    try{
+      const mod = makeWasmModule(buildWasm(b));
+      const inst = new WebAssembly.Instance(mod);
+      inst.exports.f();
+    }catch(e){}
+  }
+}
+
+// --- WASM memory grow stress ---
+function fuzzWasmMemory(){
+  try{
+    const mem = new WebAssembly.Memory({initial:1, maximum:100});
+    const view = new Uint8Array(mem.buffer);
+    view[0]=42;
+    for(let i=0;i<50;i++){
+      const old = mem.grow(1);
+      // Buffer should be detached after grow
+      const newView = new Uint8Array(mem.buffer);
+      newView[old*65536]=0xFF;
+    }
+  }catch(e){}
+
+  // Shared memory (likely blocked)
+  try{
+    const smem = new WebAssembly.Memory({initial:1, maximum:10, shared:true});
+    const view = new Int32Array(smem.buffer);
+    Atomics.add(view,0,1);
+  }catch(e){}
+
+  // Memory with 0 initial
+  try{new WebAssembly.Memory({initial:0, maximum:1})}catch(e){}
+  // Memory exceed
+  try{new WebAssembly.Memory({initial:65536})}catch(e){}
+}
+
+// --- WASM Table operations ---
+function fuzzWasmTable(){
+  try{
+    const table = new WebAssembly.Table({initial:10, maximum:100, element:'anyfunc'});
+    // Table operations
+    table.grow(5);
+    table.get(0); // should be null
+    // externref table
+    try{
+      const tExt = new WebAssembly.Table({initial:5, element:'externref'});
+      tExt.set(0, {hello:'world'});
+      tExt.set(1, 42);
+      tExt.set(2, null);
+      tExt.get(0);
+    }catch(e){}
+  }catch(e){}
+}
+
+// --- WASM compilation streaming abuse ---
+async function fuzzWasmStreaming(){
+  // Try to compile garbage as streaming
+  try{
+    const blob = new Blob([new Uint8Array(randArr(200,256))], {type:'application/wasm'});
+    const resp = new Response(blob);
+    await WebAssembly.compileStreaming(resp);
+  }catch(e){}
+  // Compile valid module streaming
+  try{
+    const validBytes = new Uint8Array([0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00]);
+    const resp = new Response(new Blob([validBytes],{type:'application/wasm'}));
+    await WebAssembly.compileStreaming(resp);
+  }catch(e){}
+}
+
+// --- WASM random bytes ---
+function fuzzWasmRandom(){
+  for(let i=0;i<100;i++){
+    const len = randInt(8,500);
+    const bytes = new Uint8Array(len);
+    // Start with valid header
+    bytes[0]=0x00;bytes[1]=0x61;bytes[2]=0x73;bytes[3]=0x6d;
+    bytes[4]=0x01;bytes[5]=0x00;bytes[6]=0x00;bytes[7]=0x00;
+    // Random payload
+    for(let j=8;j<len;j++) bytes[j]=randInt(0,256);
+    try{new WebAssembly.Module(bytes)}catch(e){}
+  }
+}
+
+// ===================== WEBGL FUZZ =====================
+
+let gl = null;
+function getGL(){
+  if(gl) return gl;
+  const c = document.createElement('canvas');
+  c.width=256;c.height=256;
+  gl = c.getContext('webgl2') || c.getContext('webgl');
+  return gl;
+}
+
+// --- Shader compilation bomb ---
+function fuzzShaderBomb(){
+  const g = getGL();
+  if(!g) return;
+  // Very large shader
+  let frag = 'precision mediump float;\nvoid main(){\nfloat x=0.0;\n';
+  for(let i=0;i<500;i++) frag += `x=sin(x+${i}.0)*cos(x-${i}.0);\n`;
+  frag += 'gl_FragColor=vec4(x);\n}';
+  const sh = g.createShader(g.FRAGMENT_SHADER);
+  g.shaderSource(sh, frag);
+  g.compileShader(sh);
+  g.getShaderInfoLog(sh);
+  g.deleteShader(sh);
+
+  // Deeply nested expressions
+  let expr = '0.0';
+  for(let i=0;i<100;i++) expr = `sin(${expr}+1.0)`;
+  const frag2 = `precision mediump float;\nvoid main(){gl_FragColor=vec4(${expr});}`;
+  const sh2 = g.createShader(g.FRAGMENT_SHADER);
+  g.shaderSource(sh2, frag2);
+  g.compileShader(sh2);
+  g.deleteShader(sh2);
+}
+
+// --- Draw call OOB ---
+function fuzzDrawCalls(){
+  const g = getGL();
+  if(!g) return;
+  // Setup minimal program
+  const vs = g.createShader(g.VERTEX_SHADER);
+  g.shaderSource(vs,'attribute vec4 p;void main(){gl_Position=p;gl_PointSize=1.0;}');
+  g.compileShader(vs);
+  const fs = g.createShader(g.FRAGMENT_SHADER);
+  g.shaderSource(fs,'precision mediump float;void main(){gl_FragColor=vec4(1,0,0,1);}');
+  g.compileShader(fs);
+  const prog = g.createProgram();
+  g.attachShader(prog,vs);g.attachShader(prog,fs);g.linkProgram(prog);g.useProgram(prog);
+
+  const buf = g.createBuffer();
+  g.bindBuffer(g.ARRAY_BUFFER, buf);
+  g.bufferData(g.ARRAY_BUFFER, new Float32Array([0,0,0,1,1,0]), g.STATIC_DRAW);
+  const loc = g.getAttribLocation(prog,'p');
+  g.enableVertexAttribArray(loc);
+  g.vertexAttribPointer(loc,2,g.FLOAT,false,0,0);
+
+  // Normal draw
+  g.drawArrays(g.TRIANGLES, 0, 3);
+  // OOB count
+  try{g.drawArrays(g.TRIANGLES, 0, 99999)}catch(e){}
+  // Negative offset (if somehow passed)
+  try{g.drawArrays(g.TRIANGLES, -1, 3)}catch(e){}
+  // drawElements without index buffer
+  try{g.drawElements(g.TRIANGLES, 3, g.UNSIGNED_SHORT, 0)}catch(e){}
+  // Huge instance count (WebGL2)
+  if(g.drawArraysInstanced) try{g.drawArraysInstanced(g.TRIANGLES,0,3,999999)}catch(e){}
+
+  g.deleteProgram(prog);g.deleteShader(vs);g.deleteShader(fs);g.deleteBuffer(buf);
+}
+
+// --- Framebuffer state machine abuse ---
+function fuzzFramebuffer(){
+  const g = getGL();
+  if(!g) return;
+  const fb = g.createFramebuffer();
+  g.bindFramebuffer(g.FRAMEBUFFER, fb);
+  // Incomplete framebuffer operations
+  g.checkFramebufferStatus(g.FRAMEBUFFER);
+  g.clear(g.COLOR_BUFFER_BIT);
+  // Attach nothing, draw
+  try{g.drawArrays(g.POINTS,0,1)}catch(e){}
+  // Renderbuffer
+  const rb = g.createRenderbuffer();
+  g.bindRenderbuffer(g.RENDERBUFFER, rb);
+  g.renderbufferStorage(g.RENDERBUFFER, g.RGBA4, 256, 256);
+  g.framebufferRenderbuffer(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.RENDERBUFFER, rb);
+  g.checkFramebufferStatus(g.FRAMEBUFFER);
+  // Delete while bound
+  g.deleteRenderbuffer(rb);
+  g.checkFramebufferStatus(g.FRAMEBUFFER);
+  g.deleteFramebuffer(fb);
+  g.bindFramebuffer(g.FRAMEBUFFER, null);
+}
+
+// --- Extension probe + malformed calls ---
+function fuzzExtensions(){
+  const g = getGL();
+  if(!g) return;
+  const exts = g.getSupportedExtensions()||[];
+  log('WebGL','Extensions found: '+exts.length,'INFO','info');
+  for(const name of exts){
+    try{
+      const ext = g.getExtension(name);
+      // Try to call known extension methods with bad args
+      if(ext && typeof ext === 'object'){
+        for(const k of Object.getOwnPropertyNames(Object.getPrototypeOf(ext)||ext)){
+          if(typeof ext[k]==='function'){
+            try{ext[k](-1,null,undefined,99999)}catch(e){}
+          }
+        }
+      }
+    }catch(e){}
+  }
+}
+
+// --- Texture format stress ---
+function fuzzTextures(){
+  const g = getGL();
+  if(!g) return;
+  const formats = g instanceof WebGL2RenderingContext ?
+    [g.RGBA, g.RGB, g.LUMINANCE, g.ALPHA, g.R8, g.RG8, g.RGB8, g.RGBA8, g.R16F, g.RGBA16F, g.RGBA32F] :
+    [g.RGBA, g.RGB, g.LUMINANCE, g.ALPHA];
+  for(const fmt of formats){
+    const tex = g.createTexture();
+    g.bindTexture(g.TEXTURE_2D, tex);
+    // Normal
+    try{g.texImage2D(g.TEXTURE_2D,0,fmt,4,4,0,g.RGBA,g.UNSIGNED_BYTE,new Uint8Array(64))}catch(e){}
+    // Zero size
+    try{g.texImage2D(g.TEXTURE_2D,0,fmt,0,0,0,g.RGBA,g.UNSIGNED_BYTE,null)}catch(e){}
+    // Huge
+    try{g.texImage2D(g.TEXTURE_2D,0,fmt,16384,16384,0,g.RGBA,g.UNSIGNED_BYTE,null)}catch(e){}
+    // Mismatch format/type
+    try{g.texImage2D(g.TEXTURE_2D,0,fmt,4,4,0,g.RGBA,g.FLOAT,null)}catch(e){}
+    g.deleteTexture(tex);
+  }
+}
+
+// --- Context loss simulation ---
+function fuzzContextLoss(){
+  const c = document.createElement('canvas');
+  c.width=64;c.height=64;
+  const g = c.getContext('webgl2')||c.getContext('webgl');
+  if(!g) return;
+  const ext = g.getExtension('WEBGL_lose_context');
+  if(!ext) return;
+  ext.loseContext();
+  // Try operations on lost context
+  try{g.createBuffer()}catch(e){}
+  try{g.clear(g.COLOR_BUFFER_BIT)}catch(e){}
+  try{g.drawArrays(g.POINTS,0,1)}catch(e){}
+  try{ext.restoreContext()}catch(e){}
+  // Operations after restore
+  setTimeout(()=>{
+    try{g.createBuffer()}catch(e){}
+  },100);
+}
+
+// --- VAO/VBO delete-after-use ---
+function fuzzVAO(){
+  const g = getGL();
+  if(!g || !g.createVertexArray) return;
+  const vao = g.createVertexArray();
+  g.bindVertexArray(vao);
+  const buf = g.createBuffer();
+  g.bindBuffer(g.ARRAY_BUFFER, buf);
+  g.bufferData(g.ARRAY_BUFFER, new Float32Array([0,0,1,1]), g.STATIC_DRAW);
+  g.enableVertexAttribArray(0);
+  g.vertexAttribPointer(0,2,g.FLOAT,false,0,0);
+  // Delete buffer while VAO references it
+  g.deleteBuffer(buf);
+  // Try to draw with deleted buffer
+  try{g.drawArrays(g.POINTS,0,2)}catch(e){}
+  g.deleteVertexArray(vao);
+  // Use deleted VAO
+  try{g.bindVertexArray(vao)}catch(e){}
+}
+
+// --- readPixels stress ---
+function fuzzReadPixels(){
+  const g = getGL();
+  if(!g) return;
+  g.clearColor(0.5,0.5,0.5,1);g.clear(g.COLOR_BUFFER_BIT);
+  // Normal
+  const px = new Uint8Array(4);
+  g.readPixels(0,0,1,1,g.RGBA,g.UNSIGNED_BYTE,px);
+  // OOB
+  try{g.readPixels(-1,-1,1,1,g.RGBA,g.UNSIGNED_BYTE,px)}catch(e){}
+  try{g.readPixels(0,0,99999,99999,g.RGBA,g.UNSIGNED_BYTE,new Uint8Array(4))}catch(e){}
+  // Wrong format
+  try{g.readPixels(0,0,1,1,g.RGB,g.FLOAT,new Float32Array(3))}catch(e){}
+  // Null buffer
+  try{g.readPixels(0,0,1,1,g.RGBA,g.UNSIGNED_BYTE,null)}catch(e){}
+}
+
+// ===================== DOM/BROWSER FUZZ =====================
+
+// --- Worker stress ---
+function fuzzWorkers(){
+  const code = `
+    self.onmessage = function(e){
+      if(e.data==='bomb'){
+        const a=[];for(let i=0;i<1000000;i++)a.push(i);
+        self.postMessage('done');
+      }
+      if(e.data==='recurse') self.postMessage(self);
+    };
+  `;
+  const blob = new Blob([code],{type:'application/javascript'});
+  const url = URL.createObjectURL(blob);
+  const workers = [];
+  for(let i=0;i<10;i++){
+    try{
+      const w = new Worker(url);
+      w.postMessage('bomb');
+      workers.push(w);
+    }catch(e){}
+  }
+  // Terminate rapidly
+  setTimeout(()=>{
+    for(const w of workers) w.terminate();
+    URL.revokeObjectURL(url);
+  },2000);
+}
+
+// --- MessageChannel flood ---
+function fuzzMessageChannel(){
+  const channels = [];
+  for(let i=0;i<50;i++){
+    const ch = new MessageChannel();
+    ch.port1.onmessage = (e)=>{
+      if(e.data<100) ch.port1.postMessage(e.data+1);
+    };
+    ch.port2.onmessage = (e)=>{
+      if(e.data<100) ch.port2.postMessage(e.data+1);
+    };
+    ch.port1.postMessage(0);
+    channels.push(ch);
+  }
+  // Transfer ports
+  try{
+    const ch1 = new MessageChannel();
+    const ch2 = new MessageChannel();
+    ch1.port1.postMessage('transfer', [ch2.port1]);
+    // Use transferred port
+    try{ch2.port1.postMessage('should fail')}catch(e){}
+  }catch(e){}
+}
+
+// --- CSS parser bomb ---
+function fuzzCSS(){
+  const style = document.createElement('style');
+  // Deep nesting via :is()
+  let sel = 'div';
+  for(let i=0;i<50;i++) sel = `:is(${sel})`;
+  style.textContent = `${sel}{color:red}`;
+  document.head.appendChild(style);
+
+  // calc() recursion
+  let calc = '1px';
+  for(let i=0;i<30;i++) calc = `calc(${calc} + 1px)`;
+  const div = document.createElement('div');
+  div.style.width = calc;
+  document.body.appendChild(div);
+
+  // Huge number of rules
+  let rules='';
+  for(let i=0;i<500;i++) rules+=`.c${i}{transform:rotate(${i}deg) scale(${1+i*0.001}) translateX(${i}px)}\n`;
+  const style2 = document.createElement('style');
+  style2.textContent = rules;
+  document.head.appendChild(style2);
+
+  // Cleanup
+  setTimeout(()=>{
+    style.remove(); style2.remove(); div.remove();
+  },1000);
+}
+
+// --- Canvas 2D + OffscreenCanvas ---
+function fuzzCanvas(){
+  const c = document.createElement('canvas');
+  c.width=512;c.height=512;
+  const ctx = c.getContext('2d');
+
+  // Many draw operations
+  for(let i=0;i<200;i++){
+    ctx.save();
+    ctx.fillStyle = `rgba(${randInt(0,255)},${randInt(0,255)},${randInt(0,255)},${Math.random()})`;
+    ctx.setTransform(Math.random()*2,Math.random(),Math.random(),Math.random()*2,randInt(0,512),randInt(0,512));
+    ctx.fillRect(0,0,randInt(1,200),randInt(1,200));
+    ctx.restore();
+  }
+
+  // getImageData on huge canvas
+  try{
+    const big = document.createElement('canvas');
+    big.width=8192;big.height=8192;
+    const bctx = big.getContext('2d');
+    bctx.fillRect(0,0,8192,8192);
+    bctx.getImageData(0,0,8192,1);
+  }catch(e){}
+
+  // OffscreenCanvas
+  try{
+    const oc = new OffscreenCanvas(256,256);
+    const octx = oc.getContext('2d');
+    octx.fillStyle='red';
+    octx.fillRect(0,0,256,256);
+    const bitmap = oc.transferToImageBitmap();
+    ctx.drawImage(bitmap,0,0);
+    bitmap.close();
+  }catch(e){}
+
+  // toDataURL / toBlob stress
+  try{c.toDataURL('image/png')}catch(e){}
+  try{c.toDataURL('image/webp',0.1)}catch(e){}
+  c.toBlob(()=>{}, 'image/png');
+}
+
+// --- Blob URL creation/revoke ---
+function fuzzBlobURL(){
+  const urls = [];
+  for(let i=0;i<200;i++){
+    const blob = new Blob([randStr(randInt(100,10000))], {type:'text/plain'});
+    urls.push(URL.createObjectURL(blob));
+  }
+  // Revoke all
+  for(const u of urls) URL.revokeObjectURL(u);
+  // Use after revoke
+  for(const u of urls.slice(0,5)){
+    try{fetch(u).catch(()=>{})}catch(e){}
+  }
+}
+
+// --- String edge cases ---
+function fuzzStrings(){
+  // Huge string
+  try{let s='x';for(let i=0;i<25;i++)s+=s;s.length}catch(e){}
+  // Rope strings
+  let rope='';
+  for(let i=0;i<10000;i++) rope+='a';
+  rope.charCodeAt(5000);
+  // Surrogate pairs
+  const surr = '\uD800\uDC00\uD800\uD800\uDC00\uDBFF\uDFFF';
+  surr.codePointAt(0); [...surr].length;
+  // String.raw
+  try{String.raw({raw:Array(10000).fill('a')})}catch(e){}
+}
+
+// --- TypedArray variety ---
+function fuzzTypedArrays(){
+  const ctors = [Int8Array,Uint8Array,Uint8ClampedArray,Int16Array,Uint16Array,Int32Array,Uint32Array,Float32Array,Float64Array,BigInt64Array,BigUint64Array];
+  for(const C of ctors){
+    try{
+      const a = new C(1000);
+      const isBig = C===BigInt64Array||C===BigUint64Array;
+      if(isBig){for(let i=0;i<1000;i++)a[i]=BigInt(i)}
+      else{for(let i=0;i<1000;i++)a[i]=i}
+      // Sort
+      a.sort();
+      // Slice
+      a.slice(100,200);
+      // subarray (shares buffer)
+      const sub = a.subarray(0,10);
+      if(isBig) sub[0]=99n; else sub[0]=99;
+      // Buffer should be shared
+      a[0]; // should be 99
+    }catch(e){}
+  }
+  // DataView
+  const buf = new ArrayBuffer(64);
+  const dv = new DataView(buf);
+  dv.setFloat64(0, 1.5);
+  dv.setInt32(8, -1);
+  dv.setUint8(12, 255);
+  dv.getFloat64(0);
+  // OOB
+  try{dv.getFloat64(60)}catch(e){}
+  try{dv.setFloat64(60, 1.0)}catch(e){}
+}
+
+// --- Object.defineProperty edge cases ---
+function fuzzDefineProperty(){
+  const obj = {};
+  // Non-configurable then redefine
+  Object.defineProperty(obj,'x',{value:1,writable:false,configurable:false});
+  try{Object.defineProperty(obj,'x',{value:2})}catch(e){}
+  // Getter/setter with side effects
+  let sideEffect=0;
+  Object.defineProperty(obj,'trap',{
+    get(){sideEffect++;if(sideEffect>100)throw new Error('too many');return sideEffect},
+    set(v){throw new Error('no set')},
+    configurable:true,enumerable:true
+  });
+  for(let i=0;i<50;i++) try{obj.trap}catch(e){}
+  // Seal + freeze
+  const o2 = {a:1,b:[2,3]};
+  Object.seal(o2);
+  try{o2.c=3}catch(e){}
+  try{delete o2.a}catch(e){}
+  o2.a=99; // writable but not extensible
+  Object.freeze(o2);
+  try{o2.a=100}catch(e){}
+}
+
+// --- JSON parse edge cases ---
+function fuzzJSON(){
+  const cases = [
+    '{}','[]','null','""','0',
+    '{"a":'.repeat(100)+'1'+'}'.repeat(100),
+    `[${Array(10000).fill('1').join(',')}]`,
+    `"${'\\u0000'.repeat(1000)}"`,
+    `{"__proto__":{"polluted":true}}`,
+    '{"constructor":{"prototype":{"isAdmin":true}}}',
+  ];
+  for(const c of cases) try{JSON.parse(c)}catch(e){}
+  // JSON.stringify edge cases
+  const circ={};circ.self=circ;
+  try{JSON.stringify(circ)}catch(e){}
+  try{JSON.stringify({toJSON(){throw new Error('boom')}})}catch(e){}
+  // Replacer abuse
+  try{JSON.stringify({a:1,b:2},function(k,v){if(k==='b')throw new Error('nope');return v})}catch(e){}
+}
+
+// --- Reflect/Proxy combo ---
+function fuzzReflect(){
+  const handler = {
+    get(t,p,r){return Reflect.get(t,p,r)},
+    set(t,p,v,r){return Reflect.set(t,p,v,r)},
+    has(t,p){return Reflect.has(t,p)},
+    deleteProperty(t,p){return Reflect.deleteProperty(t,p)},
+    apply(t,thisArg,args){return Reflect.apply(t,thisArg,args)},
+    construct(t,args){return Reflect.construct(t,args)},
+  };
+  const p = new Proxy(function(){},{...handler});
+  try{p(1,2,3)}catch(e){}
+  try{new p()}catch(e){}
+  try{p.x}catch(e){}
+  // Proxy on Proxy
+  const pp = new Proxy(p, handler);
+  try{pp(1)}catch(e){}
+  try{pp.y=2}catch(e){}
+}
+
+// --- Error edge cases ---
+function fuzzErrors(){
+  // Stack overflow
+  try{(function f(){f()})()}catch(e){}
+  // Error subclass
+  class MyError extends Error{
+    constructor(){super('custom');this.name='MyError'}
+    get stack(){throw new Error('stack bomb')}
+  }
+  try{throw new MyError()}catch(e){try{e.stack}catch(e2){}}
+  // AggregateError
+  try{
+    throw new AggregateError(
+      Array.from({length:100},(_,i)=>new Error('err'+i)),
+      'many errors'
+    );
+  }catch(e){e.errors.length}
+}
+
+// --- Generators + async generators ---
+function fuzzGenerators(){
+  function* inf(){let i=0;while(true)yield i++}
+  const g = inf();
+  for(let i=0;i<10000;i++) g.next();
+  g.return('done');
+  try{g.throw(new Error('boom'))}catch(e){}
+
+  // Async generator
+  async function* asyncInf(){let i=0;while(true){yield await Promise.resolve(i++)}}
+  const ag = asyncInf();
+  Promise.all(Array.from({length:100},()=>ag.next()));
+}
+
+// --- SharedArrayBuffer + Atomics (likely blocked) ---
+function fuzzAtomics(){
+  try{
+    const sab = new SharedArrayBuffer(256);
+    const i32 = new Int32Array(sab);
+    Atomics.store(i32,0,42);
+    Atomics.load(i32,0);
+    Atomics.add(i32,0,1);
+    Atomics.sub(i32,0,1);
+    Atomics.and(i32,0,0xFF);
+    Atomics.or(i32,0,0x100);
+    Atomics.xor(i32,0,0xFF);
+    Atomics.exchange(i32,0,99);
+    Atomics.compareExchange(i32,0,99,100);
+    Atomics.notify(i32,0,1);
+  }catch(e){}
+}
+
+// --- WeakRef + FinalizationRegistry race ---
+function fuzzWeakRefRace(){
+  const fr = new FinalizationRegistry((held)=>{
+    // Callback during GC
+    try{held.revive = {data:new ArrayBuffer(1000)}}catch(e){}
+  });
+  const refs = [];
+  for(let i=0;i<200;i++){
+    let obj = {id:i, buf:new ArrayBuffer(randInt(100,5000))};
+    const held = {id:i};
+    fr.register(obj, held, obj);
+    refs.push(new WeakRef(obj));
+    if(i%3===0) obj = null; // allow some to be GC'd
+  }
+  // Force allocation pressure
+  for(let i=0;i<500;i++) new ArrayBuffer(randInt(1000,50000));
+}
+
+// --- Number edge cases ---
+function fuzzNumbers(){
+  const edgeCases = [0, -0, NaN, Infinity, -Infinity, Number.MIN_VALUE, Number.MAX_VALUE,
+    Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, Number.EPSILON,
+    2**53, -(2**53), 2**1023, 2**-1074];
+  for(const a of edgeCases){
+    for(const b of edgeCases){
+      try{a+b;a-b;a*b;a/b;a%b;a**b;a&b;a|b;a^b;a<<b;a>>b;a>>>b}catch(e){}
+      try{Math.max(a,b);Math.min(a,b);Math.atan2(a,b)}catch(e){}
+    }
+  }
+}
+
+// --- Date edge cases ---
+function fuzzDate(){
+  const dates = [0, -1, NaN, 8640000000000000, 8640000000000001, -8640000000000001,
+    -62167219200000, 253402300800000, Number.MAX_SAFE_INTEGER];
+  for(const d of dates){
+    try{const dt = new Date(d);dt.toString();dt.toISOString();dt.getTime()}catch(e){}
+  }
+  try{new Date('invalid').toISOString()}catch(e){}
+  try{Date.parse('💀')}catch(e){}
+}
+
+// ===================== RANDOMIZED COMBOS =====================
+
+function fuzzRandomCombos(){
+  // Random type coercions
+  const values = [null,undefined,true,false,0,-0,NaN,Infinity,'','0','null',
+    {},[],(()=>{}),Symbol('s'),1n,new Date(),/x/,new Error()];
+  for(let i=0;i<200;i++){
+    const a=pick(values), b=pick(values);
+    try{a+b}catch(e){}
+    try{a==b}catch(e){}
+    try{a<b}catch(e){}
+    try{a in b}catch(e){}
+    try{a instanceof b}catch(e){}
+    try{a[b]}catch(e){}
+    try{a(...[])}catch(e){}
+    try{new a()}catch(e){}
+  }
+}
+
+// --- Random property access chains ---
+function fuzzPropertyChains(){
+  const root = globalThis;
+  function walk(obj, depth){
+    if(depth>6||!obj) return;
+    try{
+      const keys = Object.getOwnPropertyNames(obj).slice(0,20);
+      for(const k of keys){
+        try{
+          const v = obj[k];
+          if(typeof v==='object'&&v!==null) walk(v, depth+1);
+          if(typeof v==='function') try{v.length; v.name; v.prototype}catch(e){}
+        }catch(e){}
+      }
+    }catch(e){}
+  }
+  walk(root, 0);
+}
+
+// ===================== EXECUTION ENGINE =====================
+
+const allTests = [
+  // V8
+  ['V8','JIT IC Transitions', fuzzJIT_IC],
+  ['V8','OSR Boundaries', fuzzOSR],
+  ['V8','Type Feedback Poisoning', fuzzTypeFeedback],
+  ['V8','GC Pressure + WeakRef', fuzzGC],
+  ['V8','Prototype Chain Pollution', fuzzProtoChain],
+  ['V8','RegExp Edge Cases', fuzzRegExp],
+  ['V8','BigInt Cross-Type', fuzzBigInt],
+  ['V8','Intl API Malformed', fuzzIntl],
+  ['V8','ArrayBuffer Transfer/Resize', fuzzArrayBuffer],
+  ['V8','Iterator Protocol Abuse', fuzzIterator],
+  ['V8','Promise Microtask Depth', fuzzPromise],
+  ['V8','eval/Function + JIT', fuzzEval],
+  ['V8','Proxy Deep Nesting', fuzzProxy],
+  ['V8','Collections Stress', fuzzCollections],
+  ['V8','Symbol Edge Cases', fuzzSymbol],
+  ['V8','Structured Clone', fuzzStructuredClone],
+  ['V8','String Edge Cases', fuzzStrings],
+  ['V8','TypedArray Variety', fuzzTypedArrays],
+  ['V8','Object.defineProperty', fuzzDefineProperty],
+  ['V8','JSON Parse Edge Cases', fuzzJSON],
+  ['V8','Reflect/Proxy Combo', fuzzReflect],
+  ['V8','Error Edge Cases', fuzzErrors],
+  ['V8','Generators', fuzzGenerators],
+  ['V8','Atomics (SAB)', fuzzAtomics],
+  ['V8','WeakRef Race', fuzzWeakRefRace],
+  ['V8','Number Edge Cases', fuzzNumbers],
+  ['V8','Date Edge Cases', fuzzDate],
+  ['V8','Random Type Combos', fuzzRandomCombos],
+  ['V8','Property Chain Walk', fuzzPropertyChains],
+  // WASM
+  ['WASM','Malformed Sections', fuzzWasmMalformed],
+  ['WASM','Valid Edge Cases', fuzzWasmValid],
+  ['WASM','Memory Grow Stress', fuzzWasmMemory],
+  ['WASM','Table Operations', fuzzWasmTable],
+  ['WASM','Random Bytes Modules', fuzzWasmRandom],
+  // WebGL
+  ['WebGL','Shader Bomb', fuzzShaderBomb],
+  ['WebGL','Draw Call OOB', fuzzDrawCalls],
+  ['WebGL','Framebuffer Abuse', fuzzFramebuffer],
+  ['WebGL','Extension Probe', fuzzExtensions],
+  ['WebGL','Texture Format Stress', fuzzTextures],
+  ['WebGL','Context Loss Race', fuzzContextLoss],
+  ['WebGL','VAO/VBO Use-After-Delete', fuzzVAO],
+  ['WebGL','readPixels Stress', fuzzReadPixels],
+  // DOM
+  ['DOM','Worker Stress', fuzzWorkers],
+  ['DOM','MessageChannel Flood', fuzzMessageChannel],
+  ['DOM','CSS Parser Bomb', fuzzCSS],
+  ['DOM','Canvas 2D + Offscreen', fuzzCanvas],
+  ['DOM','Blob URL Stress', fuzzBlobURL],
+];
+
+const asyncTests = [
+  ['WASM','Streaming Compilation', fuzzWasmStreaming],
+];
+
+// Run all tests with random order and random repetitions
+async function megaFuzz(){
+  log('SYS','Mega-Fuzzer v1 starting','INFO — '+allTests.length+' sync + '+asyncTests.length+' async test categories','info');
+  log('SYS','User-Agent',navigator.userAgent,'info');
+
+  // Shuffle
+  const shuffled = [...allTests].sort(()=>Math.random()-0.5);
+
+  // Run sync tests
+  for(const [cat,name,fn] of shuffled){
+    run(cat, name, fn);
+    // Yield to browser every 5 tests
+    if(counts.total % 5 === 0) await new Promise(r=>setTimeout(r,0));
+  }
+
+  // Run async tests
+  for(const [cat,name,fn] of asyncTests){
+    await runAsync(cat, name, fn);
+  }
+
+  // Second pass: randomized combos with mutations
+  log('SYS','Pass 2: Randomized mutations','INFO','info');
+  for(let round=0;round<5;round++){
+    const subset = shuffled.slice(0, randInt(5, shuffled.length));
+    for(const [cat,name,fn] of subset){
+      run(cat, name+` (mutated #${round})`, fn);
+      if(counts.total % 10 === 0) await new Promise(r=>setTimeout(r,0));
+    }
+  }
+
+  // Third pass: concurrent stress
+  log('SYS','Pass 3: Concurrent stress','INFO','info');
+  const concurrent = shuffled.slice(0,10).map(([cat,name,fn])=>{
+    return new Promise(resolve=>{
+      setTimeout(()=>{
+        run(cat, name+' (concurrent)', fn);
+        resolve();
+      }, randInt(0,100));
+    });
+  });
+  await Promise.all(concurrent);
+
+  log('SYS','COMPLETE',`Total:${counts.total} PASS:${counts.pass} EXCEPTION:${counts.exception} CRASH:${counts.crash}`,'info');
+  STATS.textContent = `DONE | Total:${counts.total} PASS:${counts.pass} EXCEPTION:${counts.exception} CRASH:${counts.crash} | Time:${ts()}`;
+}
+
+megaFuzz().catch(e=>log('SYS','FATAL',e.message,'crash'));
+</script>
+</body>
+</html>
