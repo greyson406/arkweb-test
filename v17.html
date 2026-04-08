@@ -1,0 +1,206 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>LOADING</title></head>
+<body><h3>v17</h3>
+<pre id="log" style="font-size:10px;background:#111;color:#0f0;padding:8px;max-height:700px;overflow:auto;white-space:pre-wrap;"></pre>
+<script>
+function log(m){let e=document.getElementById('log');if(e)e.innerHTML+=m+'\n';document.title='['+m.substring(0,50)+']';}
+var cv=new ArrayBuffer(8);var cf=new Float64Array(cv);var cb=new BigInt64Array(cv);
+function dtoi(f){cf[0]=f;return cb[0];}function itod(i){cb[0]=i;return cf[0];}
+
+function fuzz(){
+  log('[*] v17 — Deep V8 fuzz: structure clone, RegExp, Intl, TypedArray');
+
+  // === 1. structuredClone with SharedArrayBuffer-like tricks ===
+  log('\n=== structuredClone edge cases ===');
+  // Clone object with getters that modify during serialization
+  try{
+    let cloneCount=0;
+    let evil={
+      get x(){cloneCount++;return cloneCount<3?42:new ArrayBuffer(1024);},
+      get y(){return [1.1,2.2];}
+    };
+    let cloned=structuredClone(evil);
+    log('[+] clone.x='+cloned.x+' type='+typeof cloned.x);
+    log('[+] clone.y='+cloned.y+' type='+typeof cloned.y+' isArr='+Array.isArray(cloned.y));
+  }catch(e){log('[!] clone: '+e.message.substring(0,80));}
+
+  // Clone with circular refs + TypedArray
+  try{
+    let buf=new ArrayBuffer(64);
+    let view=new Float64Array(buf);
+    view[0]=1.1;view[1]=2.2;
+    let obj={buf:buf,view:new Uint8Array(buf,0,32),self:null};
+    obj.self=obj;
+    let c=structuredClone(obj);
+    log('[+] Circular clone: view[0]='+new Float64Array(c.buf)[0]);
+    // Modify original, check clone independence
+    view[0]=9.9;
+    let cv=new Float64Array(c.buf)[0];
+    log('[+] Independence: '+(cv===1.1?'OK — separate buffer':'SHARED! val='+cv));
+  }catch(e){log('[!] circular: '+e.message.substring(0,80));}
+
+  // === 2. TypedArray with detached buffer race ===
+  log('\n=== TypedArray detach + sort ===');
+  try{
+    let ab=new ArrayBuffer(1024);
+    let ta=new Float64Array(ab);
+    for(let i=0;i<ta.length;i++) ta[i]=Math.random();
+    // Sort with comparator that detaches the buffer
+    let detached=false;
+    try{
+      ta.sort((a,b)=>{
+        if(!detached&&a>0.5){
+          ab.transfer();
+          detached=true;
+          log('[*] Detached during sort!');
+        }
+        return a-b;
+      });
+      log('[!] Sort completed after detach — should have thrown');
+    }catch(e2){
+      log('[+] Sort threw after detach: '+e2.message.substring(0,60));
+    }
+  }catch(e){log('[!] detach sort: '+e.message.substring(0,80));}
+
+  // === 3. RegExp with complex backreferences ===
+  log('\n=== RegExp internals ===');
+  try{
+    // Nested groups with large repeat
+    let re=/(((a{100}){100}){10})/;
+    let str='a'.repeat(100000);
+    let t0=Date.now();
+    let m=re.exec(str);
+    log('[+] RegExp 100^3: '+(Date.now()-t0)+'ms match='+(m?m[0].length:'null'));
+  }catch(e){log('[!] re1: '+e.message.substring(0,80));}
+
+  // RegExp.prototype[Symbol.replace] with side effects
+  try{
+    let callCount=0;
+    let evilRe={
+      [Symbol.replace](str,replacement){
+        callCount++;
+        if(callCount===1) return str.replace(/a/g,replacement);
+        return 'hijacked';
+      },
+      [Symbol.match](){return null;},
+      flags:'g'
+    };
+    let r='aaaa'.replace(evilRe,'b');
+    log('[+] Evil replace: "'+r+'"');
+  }catch(e){log('[!] replace: '+e.message.substring(0,80));}
+
+  // === 4. Intl API edge cases (ICU4C underneath) ===
+  log('\n=== Intl API ===');
+  try{
+    // Extreme locale
+    let f=new Intl.NumberFormat('ar-u-nu-arab',{notation:'engineering',maximumSignificantDigits:21});
+    log('[+] Arabic eng: '+f.format(123456789.123456789));
+  }catch(e){log('[!] intl1: '+e.message.substring(0,80));}
+  try{
+    // ListFormat with huge list
+    let lf=new Intl.ListFormat('zh',{type:'conjunction'});
+    let items=new Array(10000).fill('项目');
+    let r=lf.format(items);
+    log('[+] ListFormat 10k: len='+r.length);
+  }catch(e){log('[!] intl2: '+e.message.substring(0,80));}
+  try{
+    // Segmenter (new in recent V8)
+    let seg=new Intl.Segmenter('zh',{granularity:'grapheme'});
+    let segs=[...seg.segment('你好世界🇨🇳')];
+    log('[+] Segmenter: '+segs.length+' segments: '+segs.map(s=>s.segment).join('|'));
+  }catch(e){log('[!] segmenter: '+e.message.substring(0,80));}
+
+  // === 5. Promise + microtask flooding ===
+  log('\n=== Microtask flood ===');
+  try{
+    let resolved=0;
+    let p=Promise.resolve();
+    for(let i=0;i<100000;i++){
+      p=p.then(()=>{resolved++;});
+    }
+    p.then(()=>{
+      log('[+] 100k microtasks resolved: '+resolved);
+    });
+  }catch(e){log('[!] microtask: '+e.message.substring(0,80));}
+
+  // === 6. Object.defineProperty + Proxy double dispatch ===
+  log('\n=== defineProperty + Proxy ===');
+  try{
+    let target={};
+    let proxy=new Proxy(target,{
+      defineProperty(t,p,d){
+        // Redefine as accessor during defineProperty
+        if(p==='x'&&d.value===42){
+          Object.defineProperty(t,p,{get(){return 0xBEEF;},configurable:true});
+          return true;
+        }
+        return Reflect.defineProperty(t,p,d);
+      }
+    });
+    Object.defineProperty(proxy,'x',{value:42,writable:true,configurable:true});
+    log('[+] proxy.x='+proxy.x+' (42 or 0xBEEF?)');
+    // If proxy.x is 0xBEEF, the trap successfully intercepted defineProperty
+    log('[+] target.x='+target.x);
+  }catch(e){log('[!] defprop: '+e.message.substring(0,80));}
+
+  // === 7. ArrayBuffer.prototype.resize (resizable buffers) ===
+  log('\n=== Resizable ArrayBuffer ===');
+  try{
+    let rab=new ArrayBuffer(64,{maxByteLength:1024});
+    let view=new DataView(rab);
+    view.setFloat64(0,1.1);
+    log('[+] RAB initial: byteLength='+rab.byteLength+' max='+rab.maxByteLength);
+    rab.resize(128);
+    log('[+] After resize(128): byteLength='+rab.byteLength);
+    log('[+] Old data preserved: '+(view.getFloat64(0)===1.1?'YES':'NO'));
+    // Access beyond old size
+    view.setFloat64(64,2.2);
+    log('[+] Write at offset 64: OK');
+    // Shrink
+    rab.resize(32);
+    log('[+] After resize(32): byteLength='+rab.byteLength);
+    try{
+      let v=view.getFloat64(0);
+      log('[+] Read at 0 after shrink: '+v);
+    }catch(e2){log('[+] Read at 0 after shrink: '+e2.message.substring(0,60));}
+    try{
+      let v=view.getFloat64(32);
+      log('[!] Read at 32 after shrink to 32: '+v+' — OOB!');
+    }catch(e2){log('[+] OOB read trapped: '+e2.message.substring(0,60));}
+    // Rapid resize cycle
+    for(let i=0;i<10000;i++){
+      rab.resize(64+(i%960));
+    }
+    log('[+] 10k resize cycle: OK');
+    // Check integrity
+    rab.resize(64);
+    view.setFloat64(0,Math.PI);
+    if(view.getFloat64(0)!==Math.PI) log('[!] CORRUPTION after resize cycle!');
+    else log('[*] Integrity OK');
+  }catch(e){log('[!] RAB: '+e.message.substring(0,80));}
+
+  // === 8. FinalizationRegistry + WeakRef with heavy GC ===
+  log('\n=== Weak references + GC ===');
+  try{
+    let leaked=[];
+    let fr=new FinalizationRegistry(held=>{leaked.push(held);});
+    let refs=[];
+    for(let i=0;i<1000;i++){
+      let obj={idx:i,data:new ArrayBuffer(1024)};
+      refs.push(new WeakRef(obj));
+      fr.register(obj,i);
+    }
+    // Drop all strong refs
+    refs=refs; // keep weak refs
+    // Force GC
+    for(let i=0;i<20;i++) new ArrayBuffer(16*1024*1024);
+    // Check which objects survived
+    await new Promise(r=>setTimeout(r,200));
+    let alive=refs.filter(r=>r.deref()!==undefined).length;
+    log('[+] WeakRefs alive: '+alive+'/1000');
+    log('[+] Finalization callbacks: '+leaked.length);
+  }catch(e){log('[!] weak: '+e.message.substring(0,80));}
+
+  log('\n[*] v17 done.');
+}
+setTimeout(()=>fuzz().catch(e=>log('[-] Fatal: '+e.message)),500);
+</script></body></html>
