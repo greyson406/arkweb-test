@@ -1,0 +1,96 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>LOADING</title></head>
+<body><h3>v13 FBO OOB</h3>
+<pre id="log" style="font-size:10px;background:#111;color:#0f0;padding:8px;max-height:700px;overflow:auto;white-space:pre-wrap;"></pre>
+<canvas id="c" width="4" height="4" style="display:none;"></canvas>
+<script>
+function log(m){let e=document.getElementById('log');if(e)e.innerHTML+=m+'\n';document.title='['+m.substring(0,50)+']';}
+function hexArr(a){return Array.from(a).map(v=>(v>>>0).toString(16).padStart(2,'0')).join(' ');}
+
+function fuzz(){
+  let c=document.getElementById('c');
+  let gl=c.getContext('webgl2',{antialias:false,preserveDrawingBuffer:true});
+  log('[*] v13 — FBO OOB readPixels precision test');
+
+  // Create small FBO (4x4 pixels)
+  let fb=gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fb);
+  let tex=gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,4,4,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+  let status=gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  log('[+] FBO 4x4: '+(status===gl.FRAMEBUFFER_COMPLETE?'OK':'err'));
+
+  // Fill with known pattern
+  gl.viewport(0,0,4,4);
+  gl.clearColor(1,0,0,1); // red
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  // Read within bounds
+  let px=new Uint8Array(4);
+  gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);
+  log('[+] FBO(0,0): '+hexArr(px)+' '+(px[0]===255&&px[1]===0?'red OK':''));
+
+  gl.readPixels(3,3,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);
+  log('[+] FBO(3,3): '+hexArr(px)+' (last pixel)');
+
+  // Now try OOB reads on FBO
+  log('\n=== OOB readPixels on 4x4 FBO ===');
+  let oobResults=[];
+  for(let [x,y] of [[4,0],[0,4],[4,4],[8,8],[16,16],[100,100],[1000,1000]]){
+    gl.readPixels(x,y,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);
+    let err=gl.getError();
+    let desc=(err===0?'NO ERROR':'err=0x'+err.toString(16));
+    log('[+] FBO('+x+','+y+'): '+hexArr(px)+' '+desc);
+    oobResults.push({x,y,data:[...px],err});
+  }
+
+  // Read multiple pixels beyond boundary
+  let bigRead=new Uint8Array(64); // 16 pixels
+  gl.readPixels(0,0,16,1,gl.RGBA,gl.UNSIGNED_BYTE,bigRead);
+  let err=gl.getError();
+  log('\n[+] FBO readPixels(0,0,16,1) on 4-wide FBO:');
+  log('  err='+(err===0?'none':'0x'+err.toString(16)));
+  for(let i=0;i<16;i++){
+    let p=bigRead.slice(i*4,i*4+4);
+    log('  px['+i+']: '+hexArr(p));
+  }
+
+  // === Test 2: readPixels with negative coords ===
+  log('\n=== Negative coords ===');
+  for(let [x,y] of [[-1,0],[0,-1],[-1,-1],[-100,-100]]){
+    let npx=new Uint8Array(4);
+    gl.readPixels(x,y,1,1,gl.RGBA,gl.UNSIGNED_BYTE,npx);
+    err=gl.getError();
+    log('[+] FBO('+x+','+y+'): '+hexArr(npx)+' '+(err===0?'NO ERROR':'err=0x'+err.toString(16)));
+  }
+
+  // === Test 3: readPixels with huge width/height ===
+  log('\n=== Large readPixels ===');
+  try{
+    let hugeBuf=new Uint8Array(1024*1024); // 1MB
+    gl.readPixels(0,0,256,1024,gl.RGBA,gl.UNSIGNED_BYTE,hugeBuf);
+    err=gl.getError();
+    log('[+] readPixels(256x1024) on 4x4 FBO: '+(err===0?'NO ERROR':'err=0x'+err.toString(16)));
+    // Check if data beyond 4x4 is all zeros or contains actual data
+    let nonZero=0;
+    for(let i=64;i<hugeBuf.length;i++) if(hugeBuf[i]!==0) nonZero++;
+    log('[+] Non-zero bytes beyond 4x4: '+nonZero+(nonZero>0?' ← POTENTIAL INFO LEAK':' (all zeros)'));
+    if(nonZero>0){
+      // Show first few non-zero regions
+      for(let i=64;i<Math.min(hugeBuf.length,4096);i++){
+        if(hugeBuf[i]!==0){
+          log('[+] LEAK at offset '+i+': '+hexArr(hugeBuf.slice(i,i+16)));
+          i+=15;
+        }
+      }
+    }
+  }catch(e){log('[!] huge read: '+e.message.substring(0,80));}
+
+  // Clean up
+  gl.deleteFramebuffer(fb);
+  gl.deleteTexture(tex);
+  log('\n[*] v13 done.');
+}
+setTimeout(fuzz,500);
+</script></body></html>
