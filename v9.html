@@ -1,0 +1,168 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>LOADING</title></head>
+<body><h3>WASM Fuzz v9</h3>
+<pre id="log" style="font-size:10px;background:#111;color:#0f0;padding:8px;max-height:700px;overflow:auto;white-space:pre-wrap;"></pre>
+<script>
+function log(m){let e=document.getElementById('log');if(e)e.innerHTML+=m+'\n';document.title='['+m.substring(0,50)+']';}
+function leb(v){let r=[];do{let b=v&0x7f;v>>=7;if(v)b|=0x80;r.push(b)}while(v);return r}
+
+function buildWasm(opts){
+  let b=[0,0x61,0x73,0x6d,1,0,0,0];
+  // Type section
+  let nParams=opts.params||0, nResults=opts.results||1;
+  let pType=opts.paramType||0x7f, rType=opts.resultType||0x7f;
+  let ts=[...leb(1),0x60,...leb(nParams)];
+  for(let i=0;i<nParams;i++)ts.push(pType);
+  ts.push(...leb(nResults),rType);
+  b.push(1,...leb(ts.length),...ts);
+  // Memory
+  if(opts.memory){let ms=[...leb(1),0,...leb(opts.memPages||1)];b.push(5,...leb(ms.length),...ms);}
+  // Func
+  b.push(3,...leb(2),...leb(1),0);
+  // Export
+  let ne=opts.memory?2:1;
+  let es=[...leb(ne),1,0x66,0,0];
+  if(opts.memory)es.push(1,0x6d,2,0);
+  b.push(7,...leb(es.length),...es);
+  // Code
+  let body=[];
+  if(opts.locals){body.push(...leb(opts.locals.length));for(let l of opts.locals)body.push(...leb(l.count),l.type);}
+  else body.push(0);
+  if(opts.code)body.push(...opts.code);
+  else body.push(0x41,0x2a);
+  body.push(0x0b);
+  let ce=[...leb(body.length),...body];
+  let cs=[...leb(1),...ce];
+  b.push(0x0a,...leb(cs.length),...cs);
+  return new Uint8Array(b);
+}
+
+async function fuzz(){
+  log('[*] ArkWeb WASM Fuzz v9 — aggressive');
+
+  // === Test 1: 50000 locals + actually USE them ===
+  log('\n=== 50k locals: compile+use ===');
+  for(let n of [10000,30000,50000,60000]){
+    try{
+      // Write to local N-1, then read it back
+      let localIdx=n-1;
+      let code=[
+        0x41,0xff,0x01,  // i32.const 255
+        0x21,...leb(localIdx), // local.set N-1
+        0x20,...leb(localIdx)  // local.get N-1
+      ];
+      let m=new WebAssembly.Module(buildWasm({locals:[{count:n,type:0x7f}],code:code}));
+      let i=new WebAssembly.Instance(m);
+      let r=i.exports.f();
+      log('[+] '+n+' locals use: r='+r+(r===255?' OK':' WRONG'));
+    }catch(e){log('[!] '+n+' locals: '+e.message.substring(0,100));}
+  }
+
+  // === Test 2: Memory OOB ===
+  log('\n=== Memory OOB tests ===');
+  try{
+    let m=new WebAssembly.Module(buildWasm({
+      memory:true,memPages:1,
+      code:[0x41,0x00, 0x28,0x02,0x00] // i32.load align=2 offset=0 (load from addr 0)
+    }));
+    let i=new WebAssembly.Instance(m);
+    // Write marker then read
+    let mem=new Uint32Array(i.exports.m.buffer);
+    mem[0]=0xDEADBEEF;
+    let r=i.exports.f();
+    log('[+] mem load: 0x'+((r>>>0).toString(16))+' '+(r===-559038737?'OK':''));
+  }catch(e){log('[!] mem: '+e.message.substring(0,80));}
+
+  // Try OOB read
+  try{
+    // i32.const 0xFFFF, i32.load → should trap (OOB)
+    let m=new WebAssembly.Module(buildWasm({
+      memory:true,memPages:1,
+      code:[0x41,0xff,0xff,0x03, 0x28,0x02,0x00] // i32.const 65535, i32.load
+    }));
+    let i=new WebAssembly.Instance(m);
+    let r=i.exports.f();
+    log('[+] OOB load at 65535: r=0x'+(r>>>0).toString(16)+' (should trap!)');
+    log('[+] NO TRAP — possible OOB read!');
+  }catch(e){
+    if(e instanceof WebAssembly.RuntimeError) log('[*] OOB trapped: '+e.message.substring(0,60));
+    else log('[!] OOB unexpected: '+e.message.substring(0,80));
+  }
+
+  // === Test 3: i64 BigInt interop ===
+  log('\n=== i64 BigInt ===');
+  try{
+    // Build i64→i64 function manually
+    let b=[0,0x61,0x73,0x6d,1,0,0,0];
+    let ts=[...leb(1),0x60,...leb(1),0x7e,...leb(1),0x7e];
+    b.push(1,...leb(ts.length),...ts);
+    b.push(3,...leb(2),...leb(1),0);
+    b.push(7,...leb(4),1,1,0x66,0,0);
+    let body=[0,0x20,0,0x0b];
+    let ce=[...leb(body.length),...body];
+    let cs=[...leb(1),...ce];
+    b.push(0x0a,...leb(cs.length),...cs);
+    let m=new WebAssembly.Module(new Uint8Array(b));
+    let i=new WebAssembly.Instance(m);
+    for(let v of [0n,1n,-1n,0x7fffffffffffffffn,-(2n**63n)]){
+      let r=i.exports.f(v);
+      log('[+] i64('+v+')='+r+' '+(r===v?'OK':'MISMATCH'));
+    }
+  }catch(e){log('[!] i64: '+e.message.substring(0,80));}
+
+  // === Test 4: memory.grow stress ===
+  log('\n=== memory.grow stress ===');
+  try{
+    let m=new WebAssembly.Module(buildWasm({memory:true,memPages:1,params:1,
+      code:[0x20,0,0x40,0x00] // local.get 0, memory.grow
+    }));
+    let i=new WebAssembly.Instance(m);
+    let total=1;
+    for(let grow of [1,10,100,500,1000]){
+      let r=i.exports.f(grow);
+      if(r!==-1) total+=grow;
+      log('[+] grow('+grow+'): prev='+r+' total='+(total)+' bufSize='+i.exports.m.buffer.byteLength);
+    }
+  }catch(e){log('[!] grow: '+e.message.substring(0,80));}
+
+  // === Test 5: Shared memory + Atomics ===
+  log('\n=== SharedArrayBuffer ===');
+  try{
+    let sab=new SharedArrayBuffer(65536);
+    let view=new Int32Array(sab);
+    Atomics.store(view,0,42);
+    let r=Atomics.load(view,0);
+    log('[+] SAB+Atomics: r='+r+' '+(r===42?'OK':''));
+    // Atomics.wait in worker could trigger interesting paths
+    log('[*] SAB available — potential race condition surface');
+  }catch(e){log('[!] SAB: '+e.message.substring(0,80));}
+
+  // === Test 6: RegExp complexity bomb ===
+  log('\n=== RegExp complexity ===');
+  try{
+    let t0=Date.now();
+    let re=new RegExp('(a+)+b');
+    let r=re.test('a'.repeat(25)+'c');
+    let elapsed=Date.now()-t0;
+    log('[+] ReDoS test: '+elapsed+'ms result='+r);
+    if(elapsed>5000) log('[!] ReDoS possible — V8 irregexp may have issues');
+  }catch(e){log('[!] RegExp: '+e.message.substring(0,80));}
+
+  // === Test 7: ArrayBuffer transfer ===
+  log('\n=== ArrayBuffer detach ===');
+  try{
+    let ab=new ArrayBuffer(1024);
+    let view=new Uint8Array(ab);
+    view[0]=0x42;
+    let ab2=ab.transfer();
+    try{
+      let v=view[0]; // accessing detached buffer
+      log('[!] Detached access returned: '+v+' (should throw!)');
+    }catch(e2){log('[*] Detached access throws: '+e2.message.substring(0,60));}
+    let view2=new Uint8Array(ab2);
+    log('[+] Transfer: view2[0]='+view2[0]+' '+(view2[0]===0x42?'OK':''));
+  }catch(e){log('[!] Transfer: '+e.message.substring(0,80));}
+
+  log('\n[*] v9 done.');
+}
+setTimeout(fuzz,500);
+</script></body></html>
