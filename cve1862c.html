@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>loading...</title></head>
+<body>
+<div id="out">CVE-2026-1862 v2</div>
+<script type="module" src="cve1862_v2.mjs"></script>
+<script>
+let a = 0;
+let poll = setInterval(() => {
+  a++;
+  document.getElementById('out').textContent = 'a' + a + ': ' + document.title;
+  if (document.title.startsWith('V2:') || a > 120) clearInterval(poll);
+}, 500);
+</script>
+</body>
+</html>

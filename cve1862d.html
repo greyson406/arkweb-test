@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>loading...</title></head>
+<body>
+<div id="out">CVE-2026-1862 v3 try-catch</div>
+<script type="module" src="cve1862_v3.mjs"></script>
+<script>
+let a = 0;
+let poll = setInterval(() => {
+  a++;
+  document.getElementById('out').textContent = 'a' + a + ': ' + document.title;
+  if (document.title.startsWith('V3:') || a > 120) clearInterval(poll);
+}, 500);
+</script>
+</body>
+</html>
