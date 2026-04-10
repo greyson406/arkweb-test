@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>loading...</title></head>
+<body>
+<div id="out">CVE-2026-1862 Maglev Hole Leak Test</div>
+<script type="module" src="cve1862_trigger.mjs"></script>
+<script>
+// Poll title for results (module runs async)
+let attempts = 0;
+let poll = setInterval(() => {
+  attempts++;
+  document.getElementById('out').textContent =
+    'attempt ' + attempts + ': ' + document.title;
+  if (document.title.startsWith('CVE1862:') || attempts > 60) {
+    clearInterval(poll);
+  }
+}, 500);
+</script>
+</body>
+</html>
